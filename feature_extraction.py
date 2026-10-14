@@ -1,343 +1,356 @@
 """
-FEATURE EXTRACTION
-==================
+feature_extraction.py
 
-Convert raw Shimmer recordings into a feature table.
+Extract the 12 baseline statistical features required for classical
+machine learning on the CDTA Shimmer activity-recognition dataset.
 
-Each row represents one fixed-length sensor window.
-The default window size is 128 samples.
+Each window contains 128 consecutive samples.
+
+Features per axis:
+    max, min, mean, std
+
+Axes:
+    accelerometer X, Y, Z
+
+Total: 12 features per window.
 """
 
 import numpy as np
 import pandas as pd
 
-from scipy.stats import skew, kurtosis
 
+DEFAULT_WINDOW_SIZE = 128
 
-# The three acceleration axes used for the baseline experiment.
 AXES = {
     "x": "accel_x",
     "y": "accel_y",
-    "z": "accel_z"
+    "z": "accel_z",
 }
 
+STATISTICS = ("max", "min", "mean", "std")
 
-# ---------------------------------------------------------
-# 1. EXTRACT FEATURES FROM ONE WINDOW
-# ---------------------------------------------------------
+FEATURE_COLUMNS = [
+    f"{axis}_{stat}"
+    for axis in AXES
+    for stat in STATISTICS
+]
 
-def extract_features_from_window(
-    window,
-    include_extended=False
-):
+METADATA_COLUMNS = [
+    "activity",
+    "source_file",
+    "segment_id",
+    "window_id",
+    "window_start_sample",
+    "window_end_sample",
+    "window_size",
+]
+
+
+def get_feature_columns(df):
     """
-    Calculate statistical features from a single window.
-
-    Baseline features:
-        max, min, mean and standard deviation for X, Y and Z.
-
-    Extended features are optional.
+    Return the 12 expected baseline feature columns present in df,
+    preserving the predefined order.
     """
+    return [
+        column
+        for column in FEATURE_COLUMNS
+        if column in df.columns
+    ]
+
+
+def extract_features_from_window(window):
+    """
+    Extract 12 baseline features from a single window.
+
+    Parameters
+    ----------
+    window : pandas.DataFrame
+        Must contain accel_x, accel_y, and accel_z.
+
+    Returns
+    -------
+    dict
+        Dictionary containing exactly 12 statistical features.
+    """
+    required = list(AXES.values())
+    missing = set(required) - set(window.columns)
+
+    if missing:
+        raise ValueError(
+            f"Window is missing required columns: {sorted(missing)}"
+        )
+
+    if len(window) != DEFAULT_WINDOW_SIZE:
+        raise ValueError(
+            f"Expected {DEFAULT_WINDOW_SIZE} samples, "
+            f"received {len(window)}."
+        )
 
     features = {}
 
-    axis_values = {}
-
     for axis, column in AXES.items():
+        values = pd.to_numeric(
+            window[column],
+            errors="coerce",
+        ).to_numpy(dtype=float)
 
-        values = window[column].to_numpy(dtype=float)
-
-        axis_values[axis] = values
-
-        # Four baseline statistical features.
-        features[f"{axis}_max"] = np.max(values)
-        features[f"{axis}_min"] = np.min(values)
-        features[f"{axis}_mean"] = np.mean(values)
-
-        # Population standard deviation.
-        features[f"{axis}_std"] = np.std(
-            values,
-            ddof=0
-        )
-
-        if include_extended:
-
-            features[f"{axis}_median"] = np.median(values)
-
-            features[f"{axis}_range"] = np.ptp(values)
-
-            features[f"{axis}_iqr"] = (
-                np.percentile(values, 75)
-                - np.percentile(values, 25)
+        if not np.isfinite(values).all():
+            raise ValueError(
+                f"Non-finite values found in accelerometer axis {axis.upper()}."
             )
 
-            features[f"{axis}_rms"] = np.sqrt(
-                np.mean(values ** 2)
-            )
+        features[f"{axis}_max"] = float(np.max(values))
+        features[f"{axis}_min"] = float(np.min(values))
+        features[f"{axis}_mean"] = float(np.mean(values))
 
-            features[f"{axis}_energy"] = np.sum(
-                values ** 2
-            )
-
-            # Skewness and kurtosis are undefined or unstable
-            # for constant signals, so handle that case.
-            if np.std(values) > 0:
-
-                features[f"{axis}_skew"] = skew(
-                    values,
-                    bias=False
-                )
-
-                features[f"{axis}_kurtosis"] = kurtosis(
-                    values,
-                    bias=False
-                )
-
-            else:
-
-                features[f"{axis}_skew"] = 0.0
-                features[f"{axis}_kurtosis"] = 0.0
-
-    if include_extended:
-
-        x = axis_values["x"]
-        y = axis_values["y"]
-        z = axis_values["z"]
-
-        # Axis correlations describe how pairs of axes vary together.
-        pairs = [
-            ("x", x, "y", y),
-            ("x", x, "z", z),
-            ("y", y, "z", z)
-        ]
-
-        for axis1, values1, axis2, values2 in pairs:
-
-            if (
-                np.std(values1) > 0
-                and np.std(values2) > 0
-            ):
-
-                correlation = np.corrcoef(
-                    values1,
-                    values2
-                )[0, 1]
-
-            else:
-                correlation = 0.0
-
-            features[
-                f"{axis1}{axis2}_correlation"
-            ] = correlation
-
-        # Magnitude features.
-        magnitude = np.sqrt(
-            x ** 2 + y ** 2 + z ** 2
-        )
-
-        features["magnitude_mean"] = np.mean(magnitude)
-        features["magnitude_std"] = np.std(magnitude)
-        features["magnitude_max"] = np.max(magnitude)
-        features["magnitude_min"] = np.min(magnitude)
+        # Sample standard deviation, matching pandas' default ddof=1.
+        features[f"{axis}_std"] = float(np.std(values, ddof=1))
 
     return features
 
 
-# ---------------------------------------------------------
-# 2. EXTRACT FEATURES FROM ALL RECORDINGS
-# ---------------------------------------------------------
+def _has_consecutive_indices(group):
+    """Check whether sample indices form one uninterrupted sequence."""
+    indices = pd.to_numeric(
+        group["sample_index"],
+        errors="coerce",
+    ).to_numpy(dtype=float)
+
+    if not np.isfinite(indices).all():
+        return False
+
+    if len(indices) < 2:
+        return True
+
+    return bool(np.all(np.diff(indices) == 1))
+
 
 def extract_window_features(
     raw_df,
-    window_size=128,
-    include_extended=False
+    window_size=DEFAULT_WINDOW_SIZE,
 ):
     """
-    Divide each recording into non-overlapping windows.
+    Extract baseline features from non-overlapping windows.
 
-    Windows never cross:
-        - source files
-        - activity labels
-        - segment identifiers
+    Windows are constructed separately for each combination of
+    source_file, segment_id, and activity.
 
-    Incomplete final windows are discarded.
+    A window is accepted only if:
+    - It contains exactly window_size rows.
+    - Its sample_index values are consecutive.
+    - All three acceleration axes contain finite numeric values.
 
-    Windows containing non-finite acceleration values are skipped.
+    Incomplete windows are discarded.
+
+    Parameters
+    ----------
+    raw_df : pandas.DataFrame
+        Cleaned raw sensor data.
+    window_size : int, default=128
+        Number of samples per window.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per accepted window, with activity metadata and features.
     """
+    if not isinstance(raw_df, pd.DataFrame):
+        raise TypeError("raw_df must be a pandas DataFrame.")
 
-    if window_size < 2:
+    if window_size != DEFAULT_WINDOW_SIZE:
         raise ValueError(
-            "Window size must be at least 2."
+            f"This project uses {DEFAULT_WINDOW_SIZE}-sample windows "
+            "as specified for the baseline experiment."
         )
 
-    required_columns = {
+    required = {
         "activity",
         "source_file",
         "segment_id",
+        "sample_index",
         "accel_x",
         "accel_y",
-        "accel_z"
+        "accel_z",
     }
 
-    missing = required_columns - set(raw_df.columns)
+    missing = required - set(raw_df.columns)
 
     if missing:
         raise ValueError(
-            f"Missing required columns: {sorted(missing)}"
+            f"Raw data is missing required columns: {sorted(missing)}"
         )
 
-    rows = []
+    if raw_df.empty:
+        raise ValueError("The raw dataset is empty.")
+
+    df = raw_df.copy()
+
+    df["sample_index"] = pd.to_numeric(
+        df["sample_index"],
+        errors="coerce",
+    )
+
+    for column in AXES.values():
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df = df.dropna(
+        subset=[
+            "activity",
+            "source_file",
+            "segment_id",
+            "sample_index",
+        ]
+    )
+
+    df = df.sort_values(
+        ["source_file", "segment_id", "activity", "sample_index"],
+        kind="stable",
+    )
 
     grouping_columns = [
         "source_file",
         "segment_id",
-        "activity"
+        "activity",
     ]
 
-    for group_keys, group in raw_df.groupby(
+    feature_rows = []
+    window_number = 0
+
+    for group_keys, group in df.groupby(
         grouping_columns,
         sort=False,
-        dropna=False
+        dropna=False,
     ):
-
-        source_file, segment_id, activity = group_keys
-
-        # Preserve the temporal order of samples.
-        if "sample_index" in group.columns:
-
-            group = group.sort_values("sample_index")
-
-        group = group.reset_index(drop=True)
-
-        number_of_windows = len(group) // window_size
-
-        for window_number in range(number_of_windows):
-
-            start = window_number * window_size
-
-            end = start + window_size
-
-            window = group.iloc[start:end]
-
-            sensor_values = window[
-                ["accel_x", "accel_y", "accel_z"]
-            ].to_numpy(dtype=float)
-
-            # Never calculate features from NaN or infinite values.
-            if not np.isfinite(sensor_values).all():
-                continue
-
-            features = extract_features_from_window(
-                window,
-                include_extended=include_extended
-            )
-
-            # Add metadata to help trace the feature row.
-            features["activity"] = str(activity)
-
-            features["source_file"] = str(source_file)
-
-            features["segment_id"] = str(segment_id)
-
-            features["window_start_sample"] = int(start)
-
-            features["window_size"] = int(window_size)
-
-            rows.append(features)
-
-    feature_df = pd.DataFrame(rows)
-
-    if feature_df.empty:
-
-        raise ValueError(
-            "No valid windows were extracted. "
-            "Check your data length, column names and missing values."
+        group = group.sort_values(
+            "sample_index",
+            kind="stable",
         )
 
-    return feature_df
+        # Do not bridge missing indices. Split into uninterrupted runs.
+        indices = group["sample_index"].to_numpy(dtype=float)
+        breaks = np.flatnonzero(np.diff(indices) != 1) + 1
 
+        runs = np.split(np.arange(len(group)), breaks)
 
-# ---------------------------------------------------------
-# 3. IDENTIFY MODEL FEATURES
-# ---------------------------------------------------------
+        for run_indices in runs:
+            run = group.iloc[run_indices]
 
-def get_feature_columns(feature_df):
-    """
-    Return numeric features while excluding labels and metadata.
+            # Only complete, non-overlapping windows are used.
+            number_of_windows = len(run) // window_size
 
-    Metadata such as sample positions and filenames must not be
-    used as predictors by the classification models.
-    """
+            for window_number_in_run in range(number_of_windows):
+                start = window_number_in_run * window_size
+                end = start + window_size
 
-    excluded_columns = {
-        "activity",
-        "source_file",
-        "segment_id",
-        "recording_id",
-        "window_start_sample",
-        "window_size",
-        "sample_index"
-    }
+                window = run.iloc[start:end]
 
-    numeric_columns = feature_df.select_dtypes(
-        include=[np.number]
-    ).columns.tolist()
+                sensor_values = window[
+                    ["accel_x", "accel_y", "accel_z"]
+                ].to_numpy(dtype=float)
 
-    return [
-        column
-        for column in numeric_columns
-        if column not in excluded_columns
-    ]
+                if (
+                    len(window) != window_size
+                    or not np.isfinite(sensor_values).all()
+                ):
+                    continue
 
+                features = extract_features_from_window(window)
 
-# ---------------------------------------------------------
-# 4. VALIDATE A FEATURE TABLE
-# ---------------------------------------------------------
+                source_file, segment_id, activity = group_keys
+
+                start_sample = int(window["sample_index"].iloc[0])
+                end_sample = int(window["sample_index"].iloc[-1])
+
+                window_number += 1
+
+                row = {
+                    "activity": str(activity),
+                    "source_file": str(source_file),
+                    "segment_id": str(segment_id),
+                    "window_id": window_number,
+                    "window_start_sample": start_sample,
+                    "window_end_sample": end_sample,
+                    "window_size": window_size,
+                }
+
+                row.update(features)
+                feature_rows.append(row)
+
+    if not feature_rows:
+        raise ValueError(
+            "No valid windows were extracted. Check the accelerometer "
+            "columns, sample indices, and available sample counts."
+        )
+
+    result = pd.DataFrame(feature_rows)
+
+    # Keep metadata first, followed by exactly the 12 baseline features.
+    ordered_columns = METADATA_COLUMNS + FEATURE_COLUMNS
+
+    result = result[ordered_columns]
+
+    return result
+
 
 def validate_feature_table(feature_df):
     """
-    Validate a precomputed feature table before training.
+    Validate a table containing the 12 baseline features and activity labels.
+
+    Invalid rows are removed. The function raises an error if the
+    resulting dataset cannot support classification.
     """
+    if not isinstance(feature_df, pd.DataFrame):
+        raise TypeError("feature_df must be a pandas DataFrame.")
 
-    feature_df = feature_df.copy()
+    df = feature_df.copy()
 
-    if "activity" not in feature_df.columns:
+    required = {"activity", *FEATURE_COLUMNS}
+    missing = required - set(df.columns)
 
+    if missing:
         raise ValueError(
-            "The feature table must contain an activity column."
+            "Feature table is missing required columns: "
+            f"{sorted(missing)}"
         )
 
-    feature_df = feature_df.dropna(
-        subset=["activity"]
-    ).copy()
+    df["activity"] = df["activity"].astype("string").str.strip()
 
-    feature_df["activity"] = (
-        feature_df["activity"].astype(str)
+    df = df.dropna(subset=["activity"])
+    df = df[df["activity"] != ""]
+
+    for column in FEATURE_COLUMNS:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df[FEATURE_COLUMNS] = df[FEATURE_COLUMNS].replace(
+        [np.inf, -np.inf],
+        np.nan,
     )
 
-    feature_columns = get_feature_columns(feature_df)
+    df = df.dropna(subset=FEATURE_COLUMNS)
 
-    if not feature_columns:
-
+    if len(df) < 4:
         raise ValueError(
-            "No numeric feature columns were found."
+            "At least four valid windows are required for validation."
         )
 
-    # Replace infinity with missing values.
-    feature_df[feature_columns] = (
-        feature_df[feature_columns]
-        .replace([np.inf, -np.inf], np.nan)
-    )
-
-    # Remove unusable feature rows instead of fabricating values.
-    feature_df = feature_df.dropna(
-        subset=feature_columns
-    ).reset_index(drop=True)
-
-    if feature_df["activity"].nunique() < 2:
-
+    if df["activity"].nunique() < 2:
         raise ValueError(
-            "Classification requires at least two activity classes."
+            "At least two different activity classes are required."
         )
 
-    return feature_df, feature_columns
+    # Retain optional metadata columns when available.
+    available_metadata = [
+        column
+        for column in METADATA_COLUMNS
+        if column in df.columns
+    ]
+
+    return df[
+        available_metadata + FEATURE_COLUMNS
+    ].reset_index(drop=True)

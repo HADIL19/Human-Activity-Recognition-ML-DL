@@ -1,17 +1,15 @@
 """
-DATA UTILITIES
-==============
+data_utils.py
 
-Responsibilities:
-1. Load CSV and MATLAB (.mat) files.
-2. Standardize column names.
-3. Assign activity labels.
-4. Combine multiple recordings.
-5. Perform basic data cleaning.
-6. Calculate acceleration magnitude.
+Load and clean Shimmer accelerometer recordings.
+
+Principles:
+- Preserve original sample indices.
+- Do not automatically delete repeated sensor readings.
+- Report timestamp anomalies without assuming they are recording boundaries.
+- Remove rows only when acceleration X/Y/Z contain invalid values.
 """
 
-from io import BytesIO
 from pathlib import Path
 import re
 
@@ -19,17 +17,6 @@ import numpy as np
 import pandas as pd
 from scipy.io import loadmat
 
-
-# ---------------------------------------------------------
-# 1. EXPECTED COLUMNS FOR THE SHIMMER MAT FILE
-# ---------------------------------------------------------
-
-# This assumes that your MAT file contains 11 columns:
-# timestamp, accelerometer X/Y/Z, gyroscope X/Y/Z,
-# and four additional channels.
-#
-# IMPORTANT:
-# Verify this mapping against your actual MAT files.
 
 MAT_COLUMNS = [
     "timestamp",
@@ -45,376 +32,386 @@ MAT_COLUMNS = [
     "channel_11",
 ]
 
+COLUMN_ALIASES = {
+    "time": "timestamp",
+    "time_stamp": "timestamp",
+    "accelerometer_x": "accel_x",
+    "accelerometer_y": "accel_y",
+    "accelerometer_z": "accel_z",
+    "acc_x": "accel_x",
+    "acc_y": "accel_y",
+    "acc_z": "accel_z",
+    "accelx": "accel_x",
+    "accely": "accel_y",
+    "accelz": "accel_z",
+    "gyroscope_x": "gyro_x",
+    "gyroscope_y": "gyro_y",
+    "gyroscope_z": "gyro_z",
+    "gyrox": "gyro_x",
+    "gyroy": "gyro_y",
+    "gyroz": "gyro_z",
+}
 
-# ---------------------------------------------------------
-# 2. STANDARDIZE COLUMN NAMES
-# ---------------------------------------------------------
 
 def normalize_columns(df):
-    """
-    Convert common column names to a consistent format.
+    """Normalize column names and map common sensor aliases."""
+    result = df.copy()
+    normalized = []
 
-    Examples:
-        accX -> accel_x
-        accY -> accel_y
-        accZ -> accel_z
-        timestamp_ms -> timestamp
-        label -> activity
-    """
-
-    df = df.copy()
-
-    rename_map = {}
-
-    aliases = {
-        "timestamp_ms": "timestamp",
-        "time": "timestamp",
-        "accx": "accel_x",
-        "acc_x": "accel_x",
-        "accelx": "accel_x",
-        "accy": "accel_y",
-        "acc_y": "accel_y",
-        "accely": "accel_y",
-        "accz": "accel_z",
-        "acc_z": "accel_z",
-        "accelz": "accel_z",
-        "x": "accel_x",
-        "y": "accel_y",
-        "z": "accel_z",
-        "label": "activity",
-        "class": "activity",
-        "activity_label": "activity",
-    }
-
-    for column in df.columns:
-
-        # Standardize capitalization, spaces and hyphens.
+    for column in result.columns:
         name = str(column).strip().lower()
-        name = re.sub(r"[\s\-]+", "_", name)
+        name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+        normalized.append(COLUMN_ALIASES.get(name, name))
 
-        if name in aliases:
-            rename_map[column] = aliases[name]
-        else:
-            rename_map[column] = name
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            "Duplicate column names appeared after normalization."
+        )
 
-    df = df.rename(columns=rename_map)
+    result.columns = normalized
+    return result
+
+
+def infer_activity(filename):
+    """Infer an activity label from a filename."""
+    stem = Path(str(filename)).stem.strip()
+
+    # Remove duplicate-download suffixes such as "(1)".
+    stem = re.sub(r"\s*\(\d+\)\s*$", "", stem)
+
+    # Remove suffixes such as "_2" or "-3".
+    stem = re.sub(r"[_\-\s]+\d+$", "", stem)
+
+    stem = re.sub(r"[_\-]+", " ", stem).strip()
+    return stem.title()
+
+
+def _mat_to_dataframe(uploaded_file, filename):
+    """Read a MATLAB file containing an 11-column numeric matrix."""
+    try:
+        mat = loadmat(uploaded_file)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read MAT file '{filename}': {exc}"
+        ) from exc
+
+    candidates = []
+
+    for name, value in mat.items():
+        if name.startswith("__"):
+            continue
+
+        array = np.asarray(value)
+
+        if (
+            array.ndim == 2
+            and np.issubdtype(array.dtype, np.number)
+        ):
+            candidates.append((name, array))
+
+    if not candidates:
+        raise ValueError(
+            f"No 2D numeric matrix was found in '{filename}'."
+        )
+
+    # Prefer the MATLAB variable named "data".
+    selected = next(
+        (item for item in candidates if item[0].lower() == "data"),
+        None,
+    )
+
+    variable_name, array = selected or max(
+        candidates,
+        key=lambda item: item[1].size,
+    )
+
+    # Transpose only if the matrix appears to have channels as rows.
+    if (
+        array.shape[1] != len(MAT_COLUMNS)
+        and array.shape[0] == len(MAT_COLUMNS)
+    ):
+        array = array.T
+
+    if array.shape[1] != len(MAT_COLUMNS):
+        raise ValueError(
+            f"'{filename}' contains matrix '{variable_name}' "
+            f"with shape {array.shape}; expected 11 columns."
+        )
+
+    df = pd.DataFrame(array, columns=MAT_COLUMNS)
+
+    df["source_file"] = str(filename)
+    df["activity"] = infer_activity(filename)
+    df["segment_id"] = str(filename)
+    df["sample_index"] = np.arange(len(df), dtype=np.int64)
 
     return df
 
 
-# ---------------------------------------------------------
-# 3. INFER ACTIVITY FROM FILENAME
-# ---------------------------------------------------------
+def _read_uploaded_file(uploaded_file):
+    """Read a single uploaded MAT or CSV file."""
+    filename = getattr(uploaded_file, "name", None) or str(uploaded_file)
+    suffix = Path(filename).suffix.lower()
 
-def infer_activity(filename):
-    """
-    Infer an activity label from the filename.
+    if suffix == ".mat":
+        return _mat_to_dataframe(uploaded_file, filename)
 
-    Examples:
-        Fall(1).mat -> Fall
-        Run.mat     -> Run
-        Walk.csv    -> Walk
-    """
-
-    name = Path(filename).stem
-
-    # Remove suffixes such as (1), (2), etc.
-    name = re.sub(r"\(\d+\)$", "", name)
-
-    # Remove a trailing separator and number, if present.
-    name = re.sub(r"[_\- ]+\d+$", "", name)
-
-    return name.strip().title() or "Unknown"
-
-
-# ---------------------------------------------------------
-# 4. LOAD A MATLAB FILE
-# ---------------------------------------------------------
-
-def load_mat_file(uploaded_file):
-    """
-    Load a MATLAB file.
-
-    The preferred MATLAB variable is 'data'.
-
-    If that variable is absent, the function searches for
-    the largest two-dimensional numeric array.
-
-    The exact column mapping must match your real files.
-    """
-
-    content = uploaded_file.getvalue()
-
-    mat = loadmat(BytesIO(content))
-
-    array = None
-
-    # Prefer the variable named 'data'.
-    if (
-        "data" in mat
-        and isinstance(mat["data"], np.ndarray)
-        and mat["data"].ndim == 2
-    ):
-        array = mat["data"]
-
-    # Otherwise, find a plausible numeric matrix.
-    if array is None:
-
-        candidates = []
-
-        for key, value in mat.items():
-
-            if key.startswith("__"):
-                continue
-
-            if (
-                isinstance(value, np.ndarray)
-                and value.ndim == 2
-                and np.issubdtype(value.dtype, np.number)
-            ):
-                candidates.append(value)
-
-        if not candidates:
+    if suffix == ".csv":
+        try:
+            return pd.read_csv(uploaded_file)
+        except Exception as exc:
             raise ValueError(
-                f"No suitable numeric matrix found in {uploaded_file.name}."
-            )
+                f"Could not read CSV file '{filename}': {exc}"
+            ) from exc
 
-        array = max(candidates, key=lambda item: item.size)
-
-    # Transpose if the expected 11 columns are stored as rows.
-    if array.shape[1] != 11 and array.shape[0] == 11:
-        array = array.T
-
-    if array.shape[1] != 11:
-        raise ValueError(
-            f"{uploaded_file.name} contains {array.shape[1]} columns. "
-            "This loader expects 11 columns. Verify the MAT structure "
-            "and update MAT_COLUMNS if necessary."
-        )
-
-    return pd.DataFrame(array, columns=MAT_COLUMNS)
+    raise ValueError(
+        f"Unsupported file type '{suffix}'. Upload MAT or CSV files."
+    )
 
 
-# ---------------------------------------------------------
-# 5. LOAD AND COMBINE UPLOADED FILES
-# ---------------------------------------------------------
+def _looks_like_feature_table(df):
+    """Identify a likely precomputed feature table."""
+    if "activity" not in df.columns:
+        return False
+
+    if {"accel_x", "accel_y", "accel_z"}.issubset(df.columns):
+        return False
+
+    baseline_features = {
+        "x_max", "x_min", "x_mean", "x_std",
+        "y_max", "y_min", "y_mean", "y_std",
+        "z_max", "z_min", "z_mean", "z_std",
+    }
+
+    return len(baseline_features.intersection(df.columns)) >= 4
+
 
 def load_uploaded_files(uploaded_files):
     """
-    Load multiple sensor recordings or a precomputed feature table.
+    Load and combine uploaded MAT/CSV files.
 
-    The caller should not mix raw recordings and precomputed
-    feature tables in one upload.
+    Returns
+    -------
+    combined_df : pandas.DataFrame
+    data_type : str
+        'raw' or 'features'
     """
-
     if not uploaded_files:
-        raise ValueError("Upload at least one file.")
+        raise ValueError("Upload at least one MAT or CSV file.")
 
     frames = []
-    data_types = []
 
-    for file in uploaded_files:
-
-        filename = file.name
-        extension = Path(filename).suffix.lower()
-
-        # Load the file.
-        if extension == ".mat":
-
-            df = load_mat_file(file)
-            data_type = "raw"
-
-        elif extension == ".csv":
-
-            df = pd.read_csv(file)
-            df = normalize_columns(df)
-
-            # Recognize an existing feature table.
-            baseline_features = {
-                f"{axis}_{stat}"
-                for axis in ("x", "y", "z")
-                for stat in ("max", "min", "mean", "std")
-            }
-
-            if (
-                "activity" in df.columns
-                and baseline_features.issubset(df.columns)
-            ):
-                data_type = "features"
-            else:
-                data_type = "raw"
-
-        else:
-            raise ValueError(
-                f"Unsupported file type: {filename}"
-            )
-
-        df = normalize_columns(df)
-
-        # Preserve the origin of every row.
-        df["source_file"] = filename
-
-        # If no activity label exists, infer it from the filename.
-        if (
-            "activity" not in df.columns
-            or df["activity"].isna().all()
-        ):
-            df["activity"] = infer_activity(filename)
-
-        else:
-            df["activity"] = (
-                df["activity"]
-                .fillna(infer_activity(filename))
-                .astype(str)
-            )
-
-        frames.append(df)
-        data_types.append(data_type)
-
-    # Do not combine raw samples with extracted features.
-    if len(set(data_types)) != 1:
-        raise ValueError(
-            "Do not mix raw recordings and precomputed feature CSVs. "
-            "Upload one type at a time."
+    for uploaded_file in uploaded_files:
+        filename = (
+            getattr(uploaded_file, "name", None)
+            or str(uploaded_file)
         )
+
+        frame = normalize_columns(
+            _read_uploaded_file(uploaded_file)
+        )
+
+        if "source_file" not in frame.columns:
+            frame["source_file"] = str(filename)
+
+        if (
+            "activity" not in frame.columns
+            or frame["activity"].isna().all()
+        ):
+            frame["activity"] = infer_activity(filename)
+
+        if "segment_id" not in frame.columns:
+            frame["segment_id"] = str(filename)
+
+        frames.append(frame)
 
     combined = pd.concat(
         frames,
         ignore_index=True,
-        sort=False
+        sort=False,
     )
 
-    data_type = data_types[0]
+    combined = normalize_columns(combined)
 
-    if data_type == "raw":
+    if _looks_like_feature_table(combined):
+        return combined, "features"
 
-        required = {
-            "accel_x",
-            "accel_y",
-            "accel_z"
-        }
+    required = {"accel_x", "accel_y", "accel_z"}
+    missing = required - set(combined.columns)
 
-        missing = required - set(combined.columns)
-
-        if missing:
-            raise ValueError(
-                f"Missing acceleration columns: {sorted(missing)}. "
-                "Verify your CSV column names."
-            )
-
-        # Convert the important sensor columns to numeric values.
-        for column in [
-            "timestamp",
-            "accel_x",
-            "accel_y",
-            "accel_z"
-        ]:
-
-            if column in combined.columns:
-                combined[column] = pd.to_numeric(
-                    combined[column],
-                    errors="coerce"
-                )
-
-        # Generate a sample index within each recording.
-        combined["sample_index"] = (
-            combined.groupby("source_file").cumcount()
+    if missing:
+        raise ValueError(
+            "Raw data must contain accel_x, accel_y, and accel_z. "
+            f"Missing columns: {sorted(missing)}"
         )
 
-        # Give each file its own segment identifier.
-        if "segment_id" not in combined.columns:
-            combined["segment_id"] = combined["source_file"]
+    for column in ("accel_x", "accel_y", "accel_z"):
+        combined[column] = pd.to_numeric(
+            combined[column],
+            errors="coerce",
+        )
 
-    return combined, data_type
+    if "sample_index" not in combined.columns:
+        combined["sample_index"] = (
+            combined.groupby(
+                "source_file",
+                sort=False,
+            ).cumcount()
+        )
+    else:
+        combined["sample_index"] = pd.to_numeric(
+            combined["sample_index"],
+            errors="coerce",
+        )
 
+    return combined, "raw"
 
-# ---------------------------------------------------------
-# 6. BASIC SENSOR DATA CLEANING
-# ---------------------------------------------------------
 
 def clean_raw_data(df):
     """
-    Clean raw sensor data conservatively.
+    Remove rows with invalid acceleration measurements.
 
-    - Removes rows with missing X/Y/Z acceleration.
-    - Removes consecutive duplicate sensor rows within
-      the same recording.
-    - Calculates acceleration magnitude.
+    Repeated sensor readings and timestamp anomalies are retained
+    and reported rather than automatically deleted.
 
-    This does not automatically remove genuine high values.
+    Returns
+    -------
+    cleaned_df : pandas.DataFrame
+    report : dict
     """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("df must be a pandas DataFrame.")
 
-    df = df.copy()
+    working = normalize_columns(df)
+
+    required = {"accel_x", "accel_y", "accel_z"}
+    missing = required - set(working.columns)
+
+    if missing:
+        raise ValueError(
+            f"Missing required acceleration columns: {sorted(missing)}"
+        )
+
+    rows_before = len(working)
+
+    for column in ("accel_x", "accel_y", "accel_z"):
+        working[column] = pd.to_numeric(
+            working[column],
+            errors="coerce",
+        )
+
+    sensor_values = working[
+        ["accel_x", "accel_y", "accel_z"]
+    ].to_numpy(dtype=float)
+
+    valid_mask = np.isfinite(sensor_values).all(axis=1)
+
+    invalid_rows_removed = int((~valid_mask).sum())
+
+    # Preserve original sample_index values and row order.
+    cleaned = working.loc[valid_mask].copy()
+
+    if "source_file" not in cleaned.columns:
+        cleaned["source_file"] = "unknown"
+
+    if "activity" not in cleaned.columns:
+        cleaned["activity"] = "Unknown"
+
+    if "segment_id" not in cleaned.columns:
+        cleaned["segment_id"] = cleaned["source_file"].astype(str)
+
+    if "sample_index" not in cleaned.columns:
+        cleaned["sample_index"] = (
+            cleaned.groupby(
+                "source_file",
+                sort=False,
+            ).cumcount()
+        )
+    else:
+        cleaned["sample_index"] = pd.to_numeric(
+            cleaned["sample_index"],
+            errors="coerce",
+        )
+
+    duplicate_timestamps = 0
+    nonincreasing_timestamps = 0
+    large_timestamp_gaps = 0
+    duplicate_readings = 0
+
+    if "timestamp" in cleaned.columns:
+        cleaned["timestamp"] = pd.to_numeric(
+            cleaned["timestamp"],
+            errors="coerce",
+        )
+
+        for _, group in cleaned.groupby(
+            "source_file",
+            sort=False,
+            dropna=False,
+        ):
+            timestamps = group["timestamp"].to_numpy(dtype=float)
+            timestamps = timestamps[np.isfinite(timestamps)]
+
+            if len(timestamps) < 2:
+                continue
+
+            deltas = np.diff(timestamps)
+
+            duplicate_timestamps += int(np.sum(deltas == 0))
+            nonincreasing_timestamps += int(np.sum(deltas <= 0))
+
+            positive_deltas = deltas[deltas > 0]
+
+            if len(positive_deltas):
+                median_delta = float(np.median(positive_deltas))
+
+                if median_delta > 0:
+                    large_timestamp_gaps += int(
+                        np.sum(deltas > 5 * median_delta)
+                    )
+
+    ordered = cleaned.sort_values(
+        ["source_file", "sample_index"],
+        kind="stable",
+    )
+
+    for _, group in ordered.groupby(
+        "source_file",
+        sort=False,
+        dropna=False,
+    ):
+        values = group[
+            ["accel_x", "accel_y", "accel_z"]
+        ].to_numpy(dtype=float)
+
+        if len(values) > 1:
+            duplicate_readings += int(
+                np.all(values[1:] == values[:-1], axis=1).sum()
+            )
+
+    cleaned["magnitude"] = np.sqrt(
+        cleaned["accel_x"].to_numpy(dtype=float) ** 2
+        + cleaned["accel_y"].to_numpy(dtype=float) ** 2
+        + cleaned["accel_z"].to_numpy(dtype=float) ** 2
+    )
+
+    if cleaned.empty:
+        raise ValueError(
+            "No valid rows remain after removing invalid acceleration values."
+        )
 
     report = {
-        "rows_before": len(df)
+        "rows_before": int(rows_before),
+        "rows_after": int(len(cleaned)),
+        "invalid_sensor_rows_removed": invalid_rows_removed,
+        "consecutive_duplicate_rows_removed": 0,
+        "consecutive_duplicate_readings_detected": int(duplicate_readings),
+        "duplicate_timestamps_detected": int(duplicate_timestamps),
+        "nonincreasing_timestamp_steps_detected": int(
+            nonincreasing_timestamps
+        ),
+        "large_timestamp_gaps_detected": int(large_timestamp_gaps),
+        "timestamp_units_verified": False,
     }
 
-    # Ensure numeric sensor values.
-    for column in ["accel_x", "accel_y", "accel_z"]:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    # Remove rows where an essential acceleration value is missing.
-    missing_mask = df[
-        ["accel_x", "accel_y", "accel_z"]
-    ].isna().any(axis=1)
-
-    report["missing_acceleration_rows_removed"] = int(
-        missing_mask.sum()
-    )
-
-    df = df.loc[~missing_mask].copy()
-
-    # Check for consecutive duplicate samples.
-    comparison_columns = [
-        column
-        for column in [
-            "timestamp",
-            "accel_x",
-            "accel_y",
-            "accel_z"
-        ]
-        if column in df.columns
-    ]
-
-    if comparison_columns:
-
-        previous = (
-            df.groupby("source_file", sort=False)[
-                comparison_columns
-            ].shift(1)
-        )
-
-        # A duplicate must match the previous row in the same file.
-        duplicate_mask = (
-            df[comparison_columns]
-            .eq(previous)
-            .all(axis=1)
-            & previous.notna().all(axis=1)
-        )
-
-        report["consecutive_duplicates_removed"] = int(
-            duplicate_mask.sum()
-        )
-
-        df = df.loc[~duplicate_mask].copy()
-
-    else:
-        report["consecutive_duplicates_removed"] = 0
-
-    df = df.reset_index(drop=True)
-
-    # Calculate the magnitude of the three acceleration axes.
-    df["magnitude"] = np.sqrt(
-        df["accel_x"] ** 2
-        + df["accel_y"] ** 2
-        + df["accel_z"] ** 2
-    )
-
-    report["rows_after"] = len(df)
-
-    return df, report
+    return cleaned, report

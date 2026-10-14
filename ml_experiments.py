@@ -1,613 +1,666 @@
 """
-CLASSICAL MACHINE LEARNING
-==========================
+ml_experiments.py
+
+Classical machine-learning experiments for the CDTA Shimmer dataset.
 
 Models:
-    1. K-Nearest Neighbors
-    2. Support Vector Machine
-       - Linear
-       - RBF
-       - Polynomial
+    1. K-Nearest Neighbors (KNN)
+    2. Support Vector Machine (SVM)
     3. Decision Tree
 
+Features:
+    12 baseline statistical accelerometer features.
+
 Evaluation:
-    - Repeated stratified train/test splits
-    - GridSearchCV
-    - Accuracy
-    - Macro precision
-    - Macro recall
-    - Macro F1
-    - Matthews Correlation Coefficient (MCC)
+    Repeated stratified holdout experiments.
+    Hyperparameter tuning inside each training split.
+    Accuracy, balanced accuracy, precision, recall, F1-score, MCC,
+    confusion matrices, per-class metrics, and execution times.
+
+Important:
+    Repeated random splits are useful for assessing variability,
+    but their results are not statistically independent.
 """
 
 import time
+import warnings
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
 from sklearn.base import clone
-
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import (
+    GridSearchCV,
+    ParameterGrid,
     StratifiedShuffleSplit,
     StratifiedKFold,
-    GridSearchCV
 )
-
 from sklearn.pipeline import Pipeline
-
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    matthews_corrcoef,
-    confusion_matrix,
-    classification_report
-)
+
+# Must match feature_extraction.py.
+FEATURE_COLUMNS = [
+    "x_max",
+    "x_min",
+    "x_mean",
+    "x_std",
+    "y_max",
+    "y_min",
+    "y_mean",
+    "y_std",
+    "z_max",
+    "z_min",
+    "z_mean",
+    "z_std",
+]
+
+METRIC_COLUMNS = [
+    "accuracy",
+    "balanced_accuracy",
+    "precision_weighted",
+    "recall_weighted",
+    "f1_weighted",
+    "f1_macro",
+    "mcc",
+]
 
 
-# ---------------------------------------------------------
-# 1. DEFINE THE MODELS AND HYPERPARAMETER GRIDS
-# ---------------------------------------------------------
+def prepare_dataset(feature_df):
+    """Validate features and encode activity labels."""
 
-def build_model_grids(random_state=42):
-    """
-    Create model pipelines and their hyperparameter search spaces.
+    if not isinstance(feature_df, pd.DataFrame):
+        raise TypeError("feature_df must be a pandas DataFrame.")
 
-    Preprocessing is included inside each pipeline so that the
-    imputer and scaler are fitted only on the training data.
-    """
+    required = {"activity", *FEATURE_COLUMNS}
+    missing = required - set(feature_df.columns)
 
-    models = {
+    if missing:
+        raise ValueError(
+            "Feature table is missing required columns: "
+            f"{sorted(missing)}"
+        )
 
-        # -------------------------------------------------
-        # KNN
-        # -------------------------------------------------
+    df = feature_df.copy()
 
-        "KNN": {
+    df["activity"] = df["activity"].astype("string").str.strip()
+    df = df.dropna(subset=["activity"])
+    df = df[df["activity"] != ""]
 
-            "estimator": Pipeline([
-                (
-                    "imputer",
-                    SimpleImputer(strategy="median")
-                ),
-                (
-                    "scaler",
-                    StandardScaler()
-                ),
-                (
-                    "classifier",
-                    KNeighborsClassifier()
-                )
-            ]),
+    for column in FEATURE_COLUMNS:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-            "parameters": {
+    df[FEATURE_COLUMNS] = df[FEATURE_COLUMNS].replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
 
-                "classifier__n_neighbors": [
-                    3, 5, 7, 9, 11, 15
-                ],
+    # Drop rows only if every feature is missing.
+    # Remaining missing values are handled by the pipeline imputer.
+    df = df.dropna(subset=FEATURE_COLUMNS, how="all")
 
-                "classifier__weights": [
-                    "uniform",
-                    "distance"
-                ],
+    if df.empty:
+        raise ValueError("No valid feature rows remain.")
 
-                # p=1: Manhattan distance
-                # p=2: Euclidean distance
-                "classifier__p": [1, 2]
-            }
-        },
+    class_counts = df["activity"].value_counts()
+
+    if len(class_counts) < 2:
+        raise ValueError("At least two activity classes are required.")
+
+    if class_counts.min() < 3:
+        raise ValueError(
+            "Every activity must have at least three valid windows "
+            "for repeated holdout evaluation and cross-validation. "
+            f"Class counts: {class_counts.to_dict()}"
+        )
+
+    X = df[FEATURE_COLUMNS].reset_index(drop=True)
+    y_text = df["activity"].astype(str).to_numpy()
+
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(y_text)
+
+    return X, y, label_encoder
 
 
-        # -------------------------------------------------
-        # SVM
-        # -------------------------------------------------
+def build_models(random_state=42):
+    """Create the three classification pipelines."""
 
-        "SVM": {
-
-            "estimator": Pipeline([
-                (
-                    "imputer",
-                    SimpleImputer(strategy="median")
-                ),
-                (
-                    "scaler",
-                    StandardScaler()
-                ),
-                (
-                    "classifier",
-                    SVC()
-                )
-            ]),
-
-            # Each dictionary defines a separate search space.
-            # Polynomial-specific parameters are only searched
-            # when the polynomial kernel is selected.
-            "parameters": [
-
-                # Linear kernel
-                {
-                    "classifier__kernel": ["linear"],
-
-                    "classifier__C": [
-                        0.1, 1, 10, 100
-                    ]
-                },
-
-                # Radial Basis Function kernel
-                {
-                    "classifier__kernel": ["rbf"],
-
-                    "classifier__C": [
-                        0.1, 1, 10, 100
-                    ],
-
-                    "classifier__gamma": [
-                        "scale",
-                        "auto",
-                        0.01,
-                        0.1
-                    ]
-                },
-
-                # Polynomial kernel
-                {
-                    "classifier__kernel": ["poly"],
-
-                    "classifier__C": [
-                        0.1, 1, 10, 100
-                    ],
-
-                    "classifier__gamma": [
-                        "scale",
-                        "auto"
-                    ],
-
-                    "classifier__degree": [
-                        2, 3, 4
-                    ]
-                }
+    return {
+        "KNN": Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("classifier", KNeighborsClassifier()),
             ]
-        },
-
-
-        # -------------------------------------------------
-        # DECISION TREE
-        # -------------------------------------------------
-
-        "Decision Tree": {
-
-            "estimator": Pipeline([
+        ),
+        "SVM": Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
                 (
-                    "imputer",
-                    SimpleImputer(strategy="median")
+                    "classifier",
+                    SVC(
+                        class_weight="balanced",
+                        random_state=random_state,
+                    ),
                 ),
+            ]
+        ),
+        "Decision Tree": Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
                 (
                     "classifier",
                     DecisionTreeClassifier(
-                        random_state=random_state
-                    )
-                )
-            ]),
-
-            "parameters": {
-
-                "classifier__criterion": [
-                    "gini",
-                    "entropy",
-                    "log_loss"
-                ],
-
-                "classifier__max_depth": [
-                    None, 5, 10, 15, 20
-                ],
-
-                "classifier__min_samples_split": [
-                    2, 5, 10
-                ],
-
-                "classifier__min_samples_leaf": [
-                    1, 2, 4
-                ],
-
-                "classifier__class_weight": [
-                    None,
-                    "balanced"
-                ]
-            }
-        }
+                        class_weight="balanced",
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        ),
     }
 
-    return models
 
-
-# ---------------------------------------------------------
-# 2. CALCULATE EVALUATION METRICS
-# ---------------------------------------------------------
-
-def calculate_metrics(y_true, y_pred):
-    """
-    Calculate the metrics used to compare models.
-
-    Macro averaging gives every activity class equal weight.
-    MCC is our primary comparison metric.
-    """
+def build_parameter_grids():
+    """Return valid hyperparameter grids for GridSearchCV."""
 
     return {
+        "KNN": {
+            "classifier__n_neighbors": [3, 5, 7, 9, 11],
+            "classifier__weights": ["uniform", "distance"],
+            "classifier__p": [1, 2],
+        },
+        "SVM": [
+            {
+                "classifier__kernel": ["rbf"],
+                "classifier__C": [0.1, 1, 10],
+                "classifier__gamma": ["scale", 0.01, 0.1],
+            },
+            {
+                "classifier__kernel": ["linear"],
+                "classifier__C": [0.1, 1, 10],
+            },
+        ],
+        "Decision Tree": {
+            "classifier__criterion": ["gini", "entropy"],
+            "classifier__max_depth": [None, 5, 10, 20],
+            "classifier__min_samples_split": [2, 5, 10],
+            "classifier__min_samples_leaf": [1, 2, 4],
+        },
+    }
 
-        "accuracy": accuracy_score(
-            y_true,
-            y_pred
-        ),
 
-        "precision_macro": precision_score(
+def calculate_metrics(y_true, y_pred):
+    """Calculate classification metrics."""
+
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "precision_weighted": precision_score(
             y_true,
             y_pred,
-            average="macro",
-            zero_division=0
+            average="weighted",
+            zero_division=0,
         ),
-
-        "recall_macro": recall_score(
+        "recall_weighted": recall_score(
             y_true,
             y_pred,
-            average="macro",
-            zero_division=0
+            average="weighted",
+            zero_division=0,
         ),
-
+        "f1_weighted": f1_score(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0,
+        ),
         "f1_macro": f1_score(
             y_true,
             y_pred,
             average="macro",
-            zero_division=0
+            zero_division=0,
         ),
-
-        "mcc": matthews_corrcoef(
-            y_true,
-            y_pred
-        )
+        "mcc": matthews_corrcoef(y_true, y_pred),
     }
 
 
-# ---------------------------------------------------------
-# 3. RUN REPEATED EXPERIMENTS
-# ---------------------------------------------------------
+def _make_cv(y, random_state, max_splits=5):
+    """Create feasible stratified cross-validation folds."""
 
-def run_repeated_experiments(
-    feature_df,
-    feature_columns,
-    n_splits=10,
-    test_size=0.2,
-    tune_hyperparameters=True,
-    cv_folds=5,
-    random_state=42,
-    selected_models=None,
-    progress_callback=None
-):
-    """
-    Run multiple stratified train/test experiments.
+    _, counts = np.unique(y, return_counts=True)
 
-    All selected models use the same train/test split for each run.
+    if len(counts) < 2:
+        raise ValueError("At least two classes are required.")
 
-    Hyperparameter tuning, when enabled, takes place only inside
-    the training split. The held-out test set is not used to choose
-    the best hyperparameters.
-
-    Returns:
-        results_df: individual metrics for each model and run
-        summary_df: aggregate performance across runs
-        details: final-run predictions, reports and confusion matrices
-
-    LIMITATION:
-    Repeated random window-level splits are not independent tests.
-    If windows from the same original recording appear in both
-    training and testing, the scores may be optimistic.
-    """
+    n_splits = min(int(max_splits), int(counts.min()))
 
     if n_splits < 2:
-
         raise ValueError(
-            "Use at least two repeated splits."
+            "Cross-validation requires at least two samples "
+            "per class in the training data."
         )
 
-    if not 0 < test_size < 0.5:
-
-        raise ValueError(
-            "Test proportion must be between 0 and 0.5."
-        )
-
-    df = feature_df.copy().reset_index(drop=True)
-
-    feature_columns = [
-        column
-        for column in feature_columns
-        if column in df.columns
-    ]
-
-    if not feature_columns:
-
-        raise ValueError(
-            "No valid model feature columns were selected."
-        )
-
-    # X contains the predictors.
-    X = df[feature_columns].replace(
-        [np.inf, -np.inf],
-        np.nan
-    )
-
-    # y contains the class labels.
-    y = df["activity"].astype(str)
-
-    # Stratified splitting needs at least two examples per class.
-    class_counts = y.value_counts()
-
-    small_classes = class_counts[
-        class_counts < 2
-    ]
-
-    if not small_classes.empty:
-
-        raise ValueError(
-            "Every class needs at least two examples. "
-            f"Insufficient classes: {small_classes.to_dict()}"
-        )
-
-    model_grids = build_model_grids(
-        random_state=random_state
-    )
-
-    if selected_models:
-
-        model_grids = {
-            name: config
-            for name, config in model_grids.items()
-            if name in selected_models
-        }
-
-    if not model_grids:
-
-        raise ValueError(
-            "Select at least one model."
-        )
-
-    # Generate all splits before training any models.
-    splitter = StratifiedShuffleSplit(
+    return StratifiedKFold(
         n_splits=n_splits,
-        test_size=test_size,
-        random_state=random_state
+        shuffle=True,
+        random_state=random_state,
     )
 
-    splits = list(
-        splitter.split(X, y)
+
+def _valid_parameter_candidates(
+    model_name,
+    parameter_grid,
+    y_train,
+    cv_splits,
+):
+    """
+    Filter KNN neighbor counts and return a valid parameter grid.
+
+    Each parameter value remains a list, as required by GridSearchCV.
+    """
+
+    if model_name != "KNN":
+        return parameter_grid
+
+    _, counts = np.unique(y_train, return_counts=True)
+    actual_splits = min(int(cv_splits), int(counts.min()))
+
+    if actual_splits < 2:
+        raise ValueError(
+            "KNN tuning requires at least two samples per class."
+        )
+
+    smallest_inner_training_size = (
+        len(y_train)
+        - int(np.ceil(len(y_train) / actual_splits))
     )
 
-    result_rows = []
-    details = {}
+    valid_neighbors = [
+        n
+        for n in parameter_grid["classifier__n_neighbors"]
+        if n <= smallest_inner_training_size
+    ]
 
-    total_steps = len(splits) * len(model_grids)
-    completed = 0
-
-    # -----------------------------------------------------
-    # LOOP OVER THE REPEATED SPLITS
-    # -----------------------------------------------------
-
-    for run_number, (train_idx, test_idx) in enumerate(
-        splits,
-        start=1
-    ):
-
-        X_train = X.iloc[train_idx]
-        X_test = X.iloc[test_idx]
-
-        y_train = y.iloc[train_idx]
-        y_test = y.iloc[test_idx]
-
-        # Reduce the number of CV folds if a training class
-        # has fewer examples than the requested fold count.
-        smallest_class = int(
-            y_train.value_counts().min()
+    if not valid_neighbors:
+        raise ValueError(
+            "No valid KNN neighbor counts remain. "
+            "Increase the training set size or reduce the CV folds."
         )
 
-        actual_cv_folds = min(
-            cv_folds,
-            smallest_class
+    return {
+        "classifier__n_neighbors": valid_neighbors,
+        "classifier__weights": parameter_grid["classifier__weights"],
+        "classifier__p": parameter_grid["classifier__p"],
+    }
+
+
+def _tune_and_fit(
+    model_name,
+    model,
+    parameter_grid,
+    X_train,
+    y_train,
+    random_state,
+    inner_cv_splits=5,
+):
+    """Tune and fit a model using training data only."""
+
+    cv = _make_cv(
+        y_train,
+        random_state=random_state,
+        max_splits=inner_cv_splits,
+    )
+
+    safe_grid = _valid_parameter_candidates(
+        model_name=model_name,
+        parameter_grid=parameter_grid,
+        y_train=y_train,
+        cv_splits=cv.get_n_splits(),
+    )
+
+    search = GridSearchCV(
+        estimator=model,
+        param_grid=safe_grid,
+        scoring="balanced_accuracy",
+        cv=cv,
+        n_jobs=-1,
+        refit=True,
+        error_score="raise",
+    )
+
+    start_time = time.perf_counter()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        search.fit(X_train, y_train)
+
+    fit_seconds = time.perf_counter() - start_time
+
+    return (
+        search.best_estimator_,
+        search.best_params_,
+        float(fit_seconds),
+        float(search.best_score_),
+    )
+
+
+def _extract_per_class_metrics(y_true, y_pred, label_encoder):
+    """Build robust per-class metric records."""
+
+    class_names = label_encoder.classes_
+    class_indices = np.arange(len(class_names))
+
+    report = cast(
+        dict[str, Any],
+        classification_report(
+            y_true,
+            y_pred,
+            labels=class_indices,
+            target_names=class_names.tolist(),
+            output_dict=True,
+            zero_division=0,
+        ),
+    )
+
+    records = []
+
+    for class_index, class_name in enumerate(class_names):
+        class_report = report[str(class_name)]
+
+        records.append(
+            {
+                "class": str(class_name),
+                "precision": float(class_report["precision"]),
+                "recall": float(class_report["recall"]),
+                "f1_score": float(class_report["f1-score"]),
+                "support": int(class_report["support"]),
+            }
         )
 
-        if actual_cv_folds < 2:
+    return records
 
-            raise ValueError(
-                "Not enough examples per class in a training "
-                "split for cross-validation."
-            )
 
-        inner_cv = StratifiedKFold(
-            n_splits=actual_cv_folds,
-            shuffle=True,
-            random_state=random_state + run_number
+def _fit_final_models(
+    X,
+    y,
+    models,
+    parameter_grids,
+    random_state,
+    inner_cv_splits,
+):
+    """Tune and fit deployable models using all available windows."""
+
+    final_models = {}
+    final_model_parameters = []
+
+    for model_name, model in models.items():
+        full_cv = _make_cv(
+            y,
+            random_state=random_state,
+            max_splits=inner_cv_splits,
         )
 
-        # -------------------------------------------------
-        # TRAIN EACH SELECTED MODEL
-        # -------------------------------------------------
+        safe_grid = _valid_parameter_candidates(
+            model_name=model_name,
+            parameter_grid=parameter_grids[model_name],
+            y_train=y,
+            cv_splits=full_cv.get_n_splits(),
+        )
 
-        for model_name, config in model_grids.items():
+        search = GridSearchCV(
+            estimator=clone(model),
+            param_grid=safe_grid,
+            scoring="balanced_accuracy",
+            cv=full_cv,
+            n_jobs=-1,
+            refit=True,
+            error_score="raise",
+        )
 
-            start_time = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            search.fit(X, y)
 
-            estimator = clone(
-                config["estimator"]
-            )
+        final_models[model_name] = search.best_estimator_
 
-            best_params = {}
-            cv_best_mcc = np.nan
-
-            if tune_hyperparameters:
-
-                # MCC is used to choose hyperparameters because
-                # your dataset has imbalanced activity classes.
-                search = GridSearchCV(
-                    estimator=estimator,
-                    param_grid=config["parameters"],
-                    scoring="matthews_corrcoef",
-                    cv=inner_cv,
-                    n_jobs=-1,
-                    refit=True,
-                    error_score="raise"
-                )
-
-                search.fit(
-                    X_train,
-                    y_train
-                )
-
-                fitted_model = search.best_estimator_
-
-                best_params = search.best_params_
-
-                cv_best_mcc = float(
-                    search.best_score_
-                )
-
-            else:
-
-                fitted_model = estimator.fit(
-                    X_train,
-                    y_train
-                )
-
-            elapsed_seconds = (
-                time.perf_counter() - start_time
-            )
-
-            # Predict only on the held-out test split.
-            y_pred = fitted_model.predict(
-                X_test
-            )
-
-            metrics = calculate_metrics(
-                y_test,
-                y_pred
-            )
-
-            result_rows.append({
-
-                "run": run_number,
-
+        final_model_parameters.append(
+            {
                 "model": model_name,
+                "best_parameters": repr(search.best_params_),
+                "best_cv_balanced_accuracy": float(search.best_score_),
+            }
+        )
 
-                **metrics,
+    return final_models, pd.DataFrame(final_model_parameters)
 
-                "cv_best_mcc": cv_best_mcc,
 
-                "fit_seconds": elapsed_seconds,
+def repeated_random_split_experiments(
+    feature_df,
+    n_runs=10,
+    test_size=0.25,
+    random_state=42,
+    knn_neighbors=5,
+    inner_cv_splits=5,
+):
+    """
+    Compare KNN, SVM, and Decision Tree across repeated stratified splits.
 
-                "best_params": repr(best_params),
+    Hyperparameter tuning happens inside each training partition.
+    The test partition is reserved for evaluation.
 
-                "train_rows": len(train_idx),
+    Returns
+    -------
+    dict
+        Results, summary statistics, confusion matrices, per-class
+        reports, best parameters, label encoder, and final models.
+    """
 
-                "test_rows": len(test_idx)
-            })
+    if not isinstance(n_runs, (int, np.integer)) or n_runs < 10:
+        raise ValueError("n_runs must be an integer of at least 10.")
 
-            # Save the last run's detailed outputs for the app.
-            if run_number == len(splits):
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be between 0 and 1.")
 
-                labels = sorted(
-                    y.unique()
-                )
+    if inner_cv_splits < 2:
+        raise ValueError("inner_cv_splits must be at least 2.")
 
-                details[model_name] = {
+    X, y, label_encoder = prepare_dataset(feature_df)
 
-                    "model": fitted_model,
+    class_counts = np.bincount(np.asarray(y, dtype=np.int64))
+    n_classes = len(label_encoder.classes_)
 
-                    "y_test": y_test.to_numpy(),
+    n_samples = int(class_counts.sum())
+    n_test = int(np.ceil(n_samples * test_size))
+    n_train = n_samples - n_test
 
-                    "y_pred": np.asarray(y_pred),
+    if n_test < n_classes or n_train < n_classes:
+        raise ValueError(
+            "The dataset is too small for the selected test size "
+            "and number of classes."
+        )
 
-                    "labels": labels,
+    models = build_models(random_state=random_state)
+    parameter_grids = build_parameter_grids()
 
-                    "confusion_matrix": confusion_matrix(
-                        y_test,
-                        y_pred,
-                        labels=labels
-                    ),
-
-                    "classification_report": classification_report(
-                        y_test,
-                        y_pred,
-                        labels=labels,
-                        output_dict=True,
-                        zero_division=0
-                    ),
-
-                    "best_params": best_params
-                }
-
-            completed += 1
-
-            if progress_callback:
-
-                progress_callback(
-                    completed / total_steps,
-                    f"Run {run_number}/{len(splits)} — {model_name}"
-                )
-
-    # -----------------------------------------------------
-    # 4. SUMMARIZE THE REPEATED EXPERIMENTS
-    # -----------------------------------------------------
-
-    results_df = pd.DataFrame(
-        result_rows
+    outer_cv = StratifiedShuffleSplit(
+        n_splits=int(n_runs),
+        test_size=test_size,
+        random_state=random_state,
     )
 
-    summary_df = (
-        results_df
-        .groupby("model")
-        .agg(
+    results = []
+    per_class_reports = []
+    best_parameters = []
 
-            runs=("run", "count"),
+    confusion_matrices = {
+        name: np.zeros((n_classes, n_classes), dtype=np.int64)
+        for name in models
+    }
 
-            accuracy_mean=("accuracy", "mean"),
-            accuracy_std=("accuracy", "std"),
+    for run_number, (train_indices, test_indices) in enumerate(
+        outer_cv.split(X, y),
+        start=1,
+    ):
+        X_train = X.iloc[train_indices]
+        X_test = X.iloc[test_indices]
 
-            precision_macro_mean=(
-                "precision_macro", "mean"
-            ),
+        y_train = y[train_indices]
+        y_test = y[test_indices]
 
-            recall_macro_mean=(
-                "recall_macro", "mean"
-            ),
+        for model_name, model in models.items():
+            try:
+                (
+                    fitted_model,
+                    best_params,
+                    fit_seconds,
+                    best_cv_score,
+                ) = _tune_and_fit(
+                    model_name=model_name,
+                    model=model,
+                    parameter_grid=parameter_grids[model_name],
+                    X_train=X_train,
+                    y_train=y_train,
+                    random_state=random_state + run_number,
+                    inner_cv_splits=inner_cv_splits,
+                )
 
-            f1_macro_mean=(
-                "f1_macro", "mean"
-            ),
+                prediction_start = time.perf_counter()
+                y_pred = fitted_model.predict(X_test)
+                prediction_seconds = (
+                    time.perf_counter() - prediction_start
+                )
 
-            f1_macro_std=(
-                "f1_macro", "std"
-            ),
+                metrics = calculate_metrics(y_test, y_pred)
 
-            mcc_mean=("mcc", "mean"),
-            mcc_std=("mcc", "std"),
+                results.append(
+                    {
+                        "run": run_number,
+                        "model": model_name,
+                        **metrics,
+                        "best_cv_balanced_accuracy": best_cv_score,
+                        "tuning_and_fit_seconds": fit_seconds,
+                        "prediction_seconds": float(prediction_seconds),
+                        "best_parameters": repr(best_params),
+                    }
+                )
 
-            mcc_min=("mcc", "min"),
-            mcc_max=("mcc", "max"),
+                confusion_matrices[model_name] += confusion_matrix(
+                    y_test,
+                    y_pred,
+                    labels=np.arange(n_classes),
+                )
 
-            fit_seconds_mean=(
-                "fit_seconds", "mean"
-            )
+                class_records = _extract_per_class_metrics(
+                    y_test,
+                    y_pred,
+                    label_encoder,
+                )
+
+                for record in class_records:
+                    per_class_reports.append(
+                        {
+                            "run": run_number,
+                            "model": model_name,
+                            **record,
+                        }
+                    )
+
+                best_parameters.append(
+                    {
+                        "run": run_number,
+                        "model": model_name,
+                        "best_parameters": repr(best_params),
+                        "best_cv_balanced_accuracy": best_cv_score,
+                    }
+                )
+
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Experiment failed during run {run_number} "
+                    f"for {model_name}: {exc}"
+                ) from exc
+
+    results_df = pd.DataFrame(results)
+
+    summary_rows = []
+
+    for model_name, group in results_df.groupby("model"):
+        row = {"model": model_name}
+
+        for metric in METRIC_COLUMNS:
+            row[f"{metric}_mean"] = group[metric].mean()
+            row[f"{metric}_std"] = group[metric].std(ddof=1)
+
+        row["mean_tuning_and_fit_seconds"] = (
+            group["tuning_and_fit_seconds"].mean()
         )
-        .reset_index()
-        .sort_values(
-            "mcc_mean",
-            ascending=False
+        row["mean_prediction_seconds"] = (
+            group["prediction_seconds"].mean()
         )
-        .reset_index(drop=True)
-    )
 
-    return results_df, summary_df, details
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        "balanced_accuracy_mean",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    per_class_df = pd.DataFrame(per_class_reports)
+    best_parameters_df = pd.DataFrame(best_parameters)
+
+    try:
+        final_models, final_model_parameters_df = _fit_final_models(
+            X=X,
+            y=y,
+            models=models,
+            parameter_grids=parameter_grids,
+            random_state=random_state,
+            inner_cv_splits=inner_cv_splits,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Final model fitting failed: {exc}"
+        ) from exc
+
+    return {
+        "results": results_df,
+        "summary": summary_df,
+        "confusion_matrices": confusion_matrices,
+        "per_class_metrics": per_class_df,
+        "best_parameters": best_parameters_df,
+        "final_model_parameters": final_model_parameters_df,
+        "label_encoder": label_encoder,
+        "final_models": final_models,
+        "feature_columns": FEATURE_COLUMNS,
+        "n_runs": int(n_runs),
+        "test_size": test_size,
+        "random_state": random_state,
+        "confusion_matrix_labels": list(label_encoder.classes_),
+        "confusion_matrix_note": (
+            "Counts accumulated across repeated test splits. "
+            "A window may appear in multiple test splits."
+        ),
+        "evaluation_note": (
+            "Repeated stratified holdout results are useful for "
+            "comparing models, but runs overlap and are not "
+            "statistically independent. If independent recording or "
+            "participant identifiers become available, use a "
+            "group-aware evaluation design."
+        ),
+    }
