@@ -52,6 +52,19 @@ def quality_summary(raw, cleaned):
     } for label, df in [('Raw', raw), ('Cleaned', cleaned)]])
 
 
+def missing_values_summary(raw, cleaned):
+    columns = list(dict.fromkeys([*raw.columns, *cleaned.columns]))
+    raw_missing = raw.isna().sum()
+    cleaned_missing = cleaned.isna().sum()
+    return pd.DataFrame({
+        'Column': columns,
+        'Raw missing values': [int(raw_missing.get(column, 0)) for column in columns],
+        'Cleaned missing values': [
+            int(cleaned_missing.get(column, 0)) for column in columns
+        ],
+    })
+
+
 def timestamp_summary(df):
     if not {'timestamp', 'source_file'}.issubset(df.columns):
         return pd.DataFrame()
@@ -151,8 +164,8 @@ if raw is None or cleaned is None or features is None:
     st.info('Select a dataset and click **Load dataset** to start.')
     st.stop()
 
-(overview_tab, quality_tab, eda_tab, signals_tab, models_tab, comparison_tab, downloads_tab) = st.tabs([
-    '📊 Overview', '🧹 Data Quality', '🔎 Exploratory Analysis',
+(overview_tab, quality_tab, signals_tab, models_tab, comparison_tab, downloads_tab) = st.tabs([
+    '📊 Overview', '🧹 Data Quality',
     '📈 Raw Signals', '🤖 ML Experiments', '🏆 Model Comparison', '📥 Downloads'
 ])
 activities = sorted(cleaned['activity'].astype(str).unique().tolist())
@@ -166,7 +179,6 @@ with overview_tab:
     d.metric('Activity classes', len(activities))
     st.write('**Dataset source:**', st.session_state['loaded_source'])
     show_plot(eda.activity_counts(cleaned, features), 'overview_activity_counts.png')
-    show_plot(eda.class_proportions(cleaned), 'overview_activity_proportions.png')
     c1, c2 = st.columns(2)
     with c1:
         st.subheader('Samples per activity')
@@ -179,46 +191,20 @@ with overview_tab:
 with quality_tab:
     st.header('Data quality & timestamp diagnostics')
     st.dataframe(quality_summary(raw, cleaned), hide_index=True, width='stretch')
-    q1, q2 = st.columns(2)
-    with q1:
-        show_plot(eda.missing_values(raw), 'quality_missing_raw.png')
-    with q2:
-        show_plot(eda.missing_values(cleaned), 'quality_missing_cleaned.png')
-    show_plot(eda.missing_pattern(raw), 'quality_missing_pattern.png',
-              'A sampled-row map: black indicates missing data. Sampling is for display only.')
+    st.subheader('Missing values by column')
+    st.dataframe(
+        missing_values_summary(raw, cleaned),
+        hide_index=True,
+        width='stretch',
+    )
     if {'timestamp', 'source_file'}.issubset(raw.columns):
         st.subheader('Timestamp analysis')
         st.dataframe(timestamp_summary(raw), hide_index=True, width='stretch')
-        source = st.selectbox('Source recording for timestamp plots',
-                              sorted(raw['source_file'].astype(str).unique()), key='quality_source')
-        show_plot(eda.timestamp_differences(raw, source), 'quality_timestamp_differences.png')
         st.warning('Timestamp units have not been verified. Gaps are diagnostic, not automatically treated as recording boundaries.')
+    else:
+        st.info('Timestamp checks are unavailable because timestamp or source-file data is missing.')
     st.subheader('Preprocessing reports')
     st.json(st.session_state['data_report'])
-
-with eda_tab:
-    st.header('Exploratory data analysis')
-    st.caption('Raw accelerometer distribution plots do not change the 12-feature classical ML baseline.')
-    axis = st.selectbox('Accelerometer axis', eda.AXES, key='eda_axis')
-    chosen = st.multiselect('Activities to compare', activities, default=activities, key='eda_classes')
-    if chosen:
-        c1, c2 = st.columns(2)
-        with c1:
-            show_plot(eda.axis_distributions(cleaned, axis, chosen, kind='hist'), 'eda_histogram.png')
-        with c2:
-            try:
-                show_plot(eda.axis_distributions(cleaned, axis, chosen, kind='kde'), 'eda_density.png')
-            except (ValueError, TypeError, np.linalg.LinAlgError):
-                st.info('Density curve unavailable for this selection (insufficient variation).')
-        selected = cleaned[cleaned['activity'].astype(str).isin(chosen)]
-        c3, c4 = st.columns(2)
-        with c3:
-            show_plot(eda.activity_boxplot(selected, axis, kind='box'), 'eda_boxplot.png')
-        with c4:
-            show_plot(eda.activity_boxplot(selected, axis, kind='violin'), 'eda_violin.png')
-        st.caption('Plots may use fixed-seed subsamples for responsiveness. They describe sensor distributions, not feature importance.')
-    else:
-        st.info('Select at least one activity.')
 
 with signals_tab:
     st.header('Raw accelerometer signals')

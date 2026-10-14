@@ -10,6 +10,21 @@ Developed as part of a machine learning research internship at the **Centre de D
 
 ---
 
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Activities](#activities)
+- [Machine Learning Pipeline](#machine-learning-pipeline)
+- [Data Preprocessing](#data-preprocessing)
+- [Feature Extraction](#feature-extraction)
+- [Machine Learning Models](#machine-learning-models)
+- [Experimental Evaluation](#experimental-evaluation)
+- [Results](#results)
+- [Interactive Streamlit Dashboard](#interactive-streamlit-dashboard)
+- [Project Structure](#project-structure)
+- [Installation](#installation)
+- [Future Work](#future-work)
+
 ## Project Overview
 
 Human Activity Recognition (HAR) involves identifying physical activities from sensor measurements, such as acceleration and angular velocity.
@@ -18,7 +33,7 @@ This project implements a complete workflow covering:
 
 - Sensor data loading and preprocessing
 - Exploratory data analysis and signal visualization
-- Time-series segmentation using sliding-free, fixed-length windows
+- Time-series segmentation using non-overlapping, fixed-length windows
 - Statistical feature extraction
 - Machine learning model training and hyperparameter optimization
 - Repeated experimental evaluation
@@ -39,6 +54,8 @@ The dataset contains seven activity classes:
 | Sit | Sitting |
 | Stand | Standing |
 | Walk | Walking |
+
+The signals differ clearly between activities. Fall appears as sharp isolated spikes separated by quiet stretches, Jump as frequent high-amplitude bursts, and Sit stays close to zero. These differences in spread and extreme values are what the maximum, minimum and standard-deviation features capture.
 
 ## Machine Learning Pipeline
 
@@ -98,7 +115,7 @@ The three accelerometer axes are used:
 
 Continuous sensor signals are divided into non-overlapping windows of **128 samples**.
 
-At a sampling frequency of 50 Hz, each window represents approximately **2.56 seconds** of activity.
+At a nominal sampling frequency of 50 Hz, each window represents approximately **2.56 seconds** of activity. The actual sampling frequency should be confirmed from the recording timestamps.
 
 Each window is transformed into a feature vector for classification.
 
@@ -182,6 +199,24 @@ The following metrics are calculated:
 Results are summarized using the mean and standard deviation across repeated experiments.
 
 **Evaluation limitation:** Repeated random splits can contain overlapping test observations. Therefore, aggregated confusion matrices represent predictions across repetitions rather than independent observations. Window-level random splitting may also overestimate generalization when windows originate from the same recording.
+
+## Results
+
+Mean ± standard deviation over 10 repeated stratified train/test splits:
+
+| Model | Accuracy | Balanced accuracy | Weighted F1 | Macro F1 | MCC | Mean tuning + fit time (s) |
+|---|---|---|---|---|---|---|
+| **KNN** | **0.9621** ± 0.0089 | **0.9297** ± 0.0240 | **0.9613** ± 0.0094 | **0.9434** | **0.9545** ± 0.0107 | 1.58 |
+| Decision Tree | 0.9300 ± 0.0139 | 0.9165 ± 0.0189 | 0.9299 ± 0.0142 | 0.9145 | 0.9159 ± 0.0165 | 2.52 |
+| SVM | 0.8842 ± 0.0086 | 0.8938 ± 0.0168 | 0.8825 ± 0.0092 | 0.8955 | 0.8613 ± 0.0103 | **0.78** |
+
+**Main observations**
+
+- KNN scores highest on every quality metric, and it has the highest accuracy in all ten splits. SVM is the lowest in all ten, but it is the fastest to tune and fit.
+- For KNN and the Decision Tree, balanced accuracy and macro F1 are lower than overall accuracy, which points to weaker recognition of some minority classes (Fall is the smallest class). SVM shows the opposite pattern.
+- Run-to-run variation is small compared with the gaps between models, so the ranking KNN > Decision Tree > SVM is stable across splits.
+
+**Interpretation note:** these scores come from random window-level splits (see the evaluation limitation above), so they are likely optimistic compared with performance on unseen recordings or participants. A recording-aware or participant-aware split is the planned next step.
 
 ## Interactive Streamlit Dashboard
 
@@ -273,7 +308,7 @@ shimmer-activity-recognition-ml/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/shimmer-activity-recognition-ml.git
+git clone https://github.com/HADIL19/shimmer-activity-recognition-ml.git
 cd shimmer-activity-recognition-ml
 ```
 
