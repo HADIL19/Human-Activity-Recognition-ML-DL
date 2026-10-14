@@ -1,1074 +1,364 @@
-"""
-app.py
-
-CDTA Shimmer Activity Recognition — Classical Machine Learning
-
-Run:
-    python -m streamlit run app.py
-"""
-
+"""CDTA Shimmer HAR interactive research dashboard. Run: python -m streamlit run app.py"""
 from pathlib import Path
 import io
-import traceback
 import time
+import traceback
+import json
 from typing import cast
-
 import numpy as np
 import pandas as pd
-import streamlit as st
 import matplotlib.pyplot as plt
+import streamlit as st
 
 from data_utils import load_uploaded_files, clean_raw_data
-from feature_extraction import (
-    extract_window_features,
-    validate_feature_table,
-)
+from feature_extraction import extract_window_features, validate_feature_table
 from ml_experiments import repeated_random_split_experiments
+import eda_visualizations as eda
+import model_visualizations as mv
+
+st.set_page_config(page_title='CDTA Shimmer ML', page_icon='📊', layout='wide')
+st.title('CDTA Shimmer Activity Recognition')
+st.caption('Interactive sensor exploration · Data quality · Classical ML · Model comparison')
+DEFAULT_PATH = r'C:\Users\HP\Downloads\shimmer dataset_cdta\shimmer dataset_cdta\mat'
 
 
-# =========================================================
-# 1. PAGE CONFIGURATION
-# =========================================================
-
-st.set_page_config(
-    page_title="CDTA Shimmer ML",
-    page_icon="📊",
-    layout="wide",
-)
-
-st.title("CDTA Shimmer Activity Recognition")
-st.caption(
-    "Data preparation, raw-signal exploration, "
-    "and classical machine-learning experiments"
-)
-
-DEFAULT_DATASET_PATH = (
-    r"C:\Users\HP\Downloads\shimmer dataset_cdta"
-    r"\shimmer dataset_cdta\mat"
-)
+def show_error(exc):
+    st.error(f'{type(exc).__name__}: {exc}')
+    with st.expander('Traceback'):
+        st.code(traceback.format_exc())
 
 
-# =========================================================
-# 2. UTILITY FUNCTIONS
-# IMPORTANT: Define these BEFORE the application calls them.
-# =========================================================
-
-def clear_experiment_results():
-    """Clear results when the dataset or settings change."""
-    st.session_state["experiment_output"] = None
-    st.session_state["experiment_signature"] = None
+def csv_bytes(df):
+    return df.to_csv(index=False).encode('utf-8')
 
 
-def make_activity_counts(df):
-    """Count samples per activity."""
-    if df is None or df.empty or "activity" not in df.columns:
-        return pd.DataFrame(columns=["Activity", "Samples"])
-
-    return (
-        df["activity"]
-        .astype(str)
-        .value_counts()
-        .sort_index()
-        .rename_axis("Activity")
-        .reset_index(name="Samples")
-    )
+def show_plot(fig, filename, caption=None):
+    """Render a plot IN the app and offer an optional PNG export."""
+    if caption:
+        st.caption(caption)
+    st.pyplot(fig, width='stretch')
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format='png', dpi=160, bbox_inches='tight')
+    st.download_button('⬇ Download this chart (PNG)', buffer.getvalue(),
+                       file_name=filename, mime='image/png', key=f'png_{filename}')
+    plt.close(fig)
 
 
-def make_quality_report(raw_df, cleaned_df):
-    """Compare basic quality indicators before and after cleaning."""
+def quality_summary(raw, cleaned):
+    return pd.DataFrame([{
+        'Dataset': label, 'Rows': len(df), 'Columns': len(df.columns),
+        'Missing cells': int(df.isna().sum().sum()),
+        'Duplicate rows': int(df.duplicated().sum()),
+    } for label, df in [('Raw', raw), ('Cleaned', cleaned)]])
+
+
+def timestamp_summary(df):
+    if not {'timestamp', 'source_file'}.issubset(df.columns):
+        return pd.DataFrame()
     rows = []
-
-    for name, df in [
-        ("Raw data", raw_df),
-        ("Cleaned data", cleaned_df),
-    ]:
-        rows.append(
-            {
-                "Dataset": name,
-                "Rows": len(df),
-                "Columns": len(df.columns),
-                "Missing cells": int(df.isna().sum().sum()),
-                "Duplicate rows": int(df.duplicated().sum()),
-            }
-        )
-
+    for source, group in df.groupby('source_file', sort=False, dropna=False):
+        ts = pd.to_numeric(group['timestamp'], errors='coerce').to_numpy(dtype=float)
+        d = np.diff(ts)
+        d = d[np.isfinite(d)]
+        positive = d[d > 0]
+        median = float(np.median(positive)) if len(positive) else np.nan
+        rows.append({'Source file': str(source), 'Rows': len(group),
+                     'Missing timestamps': int(np.sum(~np.isfinite(ts))),
+                     'Non-increasing differences': int(np.sum(d <= 0)),
+                     'Median positive difference': median,
+                     'Large positive differences (>5× median)':
+                     int(np.sum(d > 5 * median)) if np.isfinite(median) and median > 0 else 0})
     return pd.DataFrame(rows)
 
 
-def make_timestamp_report(df):
-    """Summarize timestamp differences without assuming their units."""
-    columns = [
-        "Source file",
-        "Rows",
-        "Missing timestamps",
-        "Non-increasing differences",
-        "Median positive difference",
-        "Large positive differences",
-    ]
-
-    if df is None or df.empty or "timestamp" not in df.columns:
-        return pd.DataFrame(columns=columns)
-
-    rows = []
-
-    for source_file, group in df.groupby(
-        "source_file",
-        sort=False,
-        dropna=False,
-    ):
-        timestamp = pd.to_numeric(
-            group["timestamp"],
-            errors="coerce",
-        )
-
-        values = timestamp.to_numpy(dtype=float)
-        valid = values[np.isfinite(values)]
-
-        if len(valid) >= 2:
-            differences = np.diff(valid)
-            positive = differences[differences > 0]
-
-            median_positive = (
-                float(np.median(positive))
-                if len(positive)
-                else np.nan
-            )
-
-            non_increasing = int(np.sum(differences <= 0))
-
-            large_positive = (
-                int(np.sum(differences > 5 * median_positive))
-                if np.isfinite(median_positive)
-                and median_positive > 0
-                else 0
-            )
-        else:
-            median_positive = np.nan
-            non_increasing = 0
-            large_positive = 0
-
-        rows.append(
-            {
-                "Source file": str(source_file),
-                "Rows": len(group),
-                "Missing timestamps": int(timestamp.isna().sum()),
-                "Non-increasing differences": non_increasing,
-                "Median positive difference": median_positive,
-                "Large positive differences": large_positive,
-            }
-        )
-
-    return pd.DataFrame(rows, columns=columns)
-
-
-def make_confusion_matrix_figure(
-    matrix,
-    labels,
-    title,
-    normalize=False,
-):
-    """Create a confusion-matrix visualization."""
+def confusion_plot(matrix, labels, model, normalized=False):
     matrix = np.asarray(matrix, dtype=float)
-
-    if normalize:
-        row_sums = matrix.sum(axis=1, keepdims=True)
-        matrix = np.divide(
-            matrix,
-            row_sums,
-            out=np.zeros_like(matrix),
-            where=row_sums != 0,
-        )
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-
-    image = ax.imshow(matrix, interpolation="nearest")
+    if normalized:
+        sums = matrix.sum(axis=1, keepdims=True)
+        matrix = np.divide(matrix, sums, out=np.zeros_like(matrix), where=sums != 0)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    image = ax.imshow(matrix, cmap='Blues', vmin=0)
     fig.colorbar(image, ax=ax)
-
-    ax.set(
-        title=title,
-        xlabel="Predicted activity",
-        ylabel="True activity",
-        xticks=np.arange(len(labels)),
-        yticks=np.arange(len(labels)),
-        xticklabels=labels,
-        yticklabels=labels,
-    )
-
-    plt.setp(
-        ax.get_xticklabels(),
-        rotation=45,
-        ha="right",
-        rotation_mode="anchor",
-    )
-
+    ax.set_xticks(np.arange(len(labels)), labels, rotation=45, ha='right')
+    ax.set_yticks(np.arange(len(labels)), labels)
+    ax.set_xlabel('Predicted activity')
+    ax.set_ylabel('True activity')
+    ax.set_title(f'{model}: ' + ('row-normalized' if normalized else 'accumulated counts'))
     threshold = matrix.max() / 2 if matrix.size else 0
-
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            cell_text = (
-                f"{matrix[i, j]:.2f}"
-                if normalize
-                else str(int(matrix[i, j]))
-            )
-
-            ax.text(
-                j,
-                i,
-                cell_text,
-                ha="center",
-                va="center",
-                color=(
-                    "white"
-                    if matrix[i, j] > threshold
-                    else "black"
-                ),
-                fontsize=8,
-            )
-
+            ax.text(j, i, f'{matrix[i,j]:.2f}' if normalized else f'{int(matrix[i,j])}',
+                    ha='center', va='center', fontsize=8,
+                    color='white' if matrix[i,j] > threshold else 'black')
     fig.tight_layout()
     return fig
 
 
-def dataframe_to_csv(df):
-    """Convert a DataFrame into downloadable CSV bytes."""
-    return df.to_csv(index=False).encode("utf-8")
+for key in ['raw_data', 'cleaned_data', 'feature_table', 'data_report',
+            'loaded_source', 'experiment_output', 'experiment_signature']:
+    st.session_state.setdefault(key, None)
 
-
-def figure_to_png_bytes(signal_data):
-    """
-    Convert the selected activity's accelerometer signals to PNG bytes.
-
-    This function is defined BEFORE the Raw Signals tab uses it,
-    preventing the previous NameError.
-    """
-    fig, axes = plt.subplots(
-        3,
-        1,
-        figsize=(12, 8),
-        sharex=True,
-    )
-
-    columns = [
-        ("accel_x", "Accelerometer X"),
-        ("accel_y", "Accelerometer Y"),
-        ("accel_z", "Accelerometer Z"),
-    ]
-
-    x_values = signal_data["sample_index"].to_numpy()
-
-    for ax, (column, title) in zip(axes, columns):
-        if column not in signal_data.columns:
-            ax.set_title(f"{title}: column unavailable")
-            continue
-
-        y_values = pd.to_numeric(
-            signal_data[column],
-            errors="coerce",
-        )
-
-        ax.plot(x_values, y_values, linewidth=0.8)
-        ax.set_title(title)
-        ax.set_ylabel("Value")
-        ax.grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Original sample index")
-    fig.tight_layout()
-
-    buffer = io.BytesIO()
-
-    try:
-        fig.savefig(
-            buffer,
-            format="png",
-            dpi=150,
-            bbox_inches="tight",
-        )
-    finally:
-        plt.close(fig)
-
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def show_exception(error):
-    """Display an error and its traceback."""
-    st.error(f"{type(error).__name__}: {error}")
-
-    with st.expander("Technical details"):
-        st.code(traceback.format_exc())
-
-
-# =========================================================
-# 3. SESSION STATE
-# =========================================================
-
-SESSION_DEFAULTS = {
-    "raw_data": None,
-    "cleaned_data": None,
-    "data_report": None,
-    "feature_table": None,
-    "experiment_output": None,
-    "loaded_source": None,
-    "experiment_signature": None,
-}
-
-for key, value in SESSION_DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-
-# =========================================================
-# 4. SIDEBAR
-# =========================================================
-
-st.sidebar.header("Project settings")
-
-st.sidebar.markdown(
-    """
-    **Baseline experiment**
-    - Window size: 128 samples
-    - Window duration: approximately 2.56 seconds at 50 Hz
-    - Features: 12 accelerometer statistics
-    - Models: KNN, SVM, Decision Tree
-    """
-)
-
+st.sidebar.header('Project settings')
+st.sidebar.markdown('**Baseline:** 128 samples/window · 12 X/Y/Z statistics · KNN / SVM / Decision Tree')
+folder_path = st.sidebar.text_input('Dataset folder', DEFAULT_PATH)
+uploads = st.sidebar.file_uploader('Or upload MAT/CSV files', type=['mat', 'csv'], accept_multiple_files=True)
 st.sidebar.divider()
+runs = st.sidebar.number_input('Repeated experiments', min_value=10, max_value=100, value=10, step=10)
+test_size = st.sidebar.slider('Test set proportion', 0.10, 0.40, 0.25, 0.05)
+seed = st.sidebar.number_input('Random seed', min_value=0, max_value=999999, value=42)
+folds = st.sidebar.selectbox('Tuning CV folds', [2, 3, 4, 5], index=3)
+st.sidebar.caption('Repeated grid search can take several minutes.')
 
-dataset_path = st.sidebar.text_input(
-    "Dataset folder",
-    value=DEFAULT_DATASET_PATH,
-)
-
-uploaded_files = st.sidebar.file_uploader(
-    "Or upload MAT/CSV files",
-    type=["mat", "csv"],
-    accept_multiple_files=True,
-)
-
-st.sidebar.divider()
-
-n_runs = st.sidebar.number_input(
-    "Repeated experiments",
-    min_value=10,
-    max_value=100,
-    value=10,
-    step=10,
-)
-
-test_size = st.sidebar.slider(
-    "Test set proportion",
-    min_value=0.10,
-    max_value=0.40,
-    value=0.25,
-    step=0.05,
-)
-
-random_state = st.sidebar.number_input(
-    "Random seed",
-    min_value=0,
-    max_value=999999,
-    value=42,
-    step=1,
-)
-
-inner_cv_splits = st.sidebar.selectbox(
-    "Hyperparameter-tuning CV folds",
-    options=[2, 3, 4, 5],
-    index=3,
-)
-
-st.sidebar.caption(
-    "More runs and CV folds require more computation."
-)
-
-
-# =========================================================
-# 5. LOAD DATA
-# =========================================================
-
-st.subheader("1. Load dataset")
-
+st.subheader('Load dataset')
 load_col, reset_col = st.columns([3, 1])
-
 with load_col:
-    load_clicked = st.button(
-        "Load dataset",
-        type="primary",
-        width="stretch",
-    )
-
+    load_clicked = st.button('Load dataset', type='primary', width='stretch')
 with reset_col:
-    reset_clicked = st.button(
-        "Reset results",
-        width="stretch",
-    )
-
+    reset_clicked = st.button('Reset experiment results', width='stretch')
 if reset_clicked:
-    clear_experiment_results()
-    st.success("Experiment results cleared.")
-
+    st.session_state['experiment_output'] = None
+    st.session_state['experiment_signature'] = None
+    st.success('Experiment results cleared.')
 if load_clicked:
     try:
-        with st.spinner("Loading and preprocessing recordings..."):
-
-            if uploaded_files:
-                source_files = uploaded_files
-                source_description = "Uploaded files"
+        with st.spinner('Loading, cleaning, and extracting windows...'):
+            if uploads:
+                sources = uploads
+                description = 'Uploaded files'
             else:
-                folder = Path(dataset_path)
+                folder = Path(folder_path)
+                if not folder.is_dir():
+                    raise FileNotFoundError(f'Dataset folder does not exist: {folder}')
+                sources = sorted([*folder.glob('*.mat'), *folder.glob('*.csv')])
+                if not sources:
+                    raise FileNotFoundError('No MAT or CSV files in selected folder.')
+                description = str(folder)
+            raw, initial = cast(tuple[pd.DataFrame, object], load_uploaded_files(sources))
+            cleaned, cleaning = clean_raw_data(raw)
+            features = validate_feature_table(extract_window_features(cleaned, window_size=128))
+            st.session_state.update(raw_data=raw, cleaned_data=cleaned, feature_table=features,
+                                    data_report={'initial': initial, 'cleaning': cleaning},
+                                    loaded_source=description, experiment_output=None,
+                                    experiment_signature=None)
+        st.success(f'Loaded {len(raw):,} rows and extracted {len(features):,} windows.')
+    except Exception as exc:
+        show_error(exc)
 
-                if not folder.exists():
-                    raise FileNotFoundError(
-                        f"Dataset folder does not exist: {folder}"
-                    )
-
-                source_files = sorted(
-                    list(folder.glob("*.mat"))
-                    + list(folder.glob("*.csv"))
-                )
-
-                if not source_files:
-                    raise FileNotFoundError(
-                        "No .mat or .csv files were found in the folder."
-                    )
-
-                source_description = str(folder)
-
-            raw_df, initial_report = cast(
-                tuple[pd.DataFrame, dict],
-                load_uploaded_files(source_files),
-            )
-
-            cleaned_df, cleaning_report = clean_raw_data(
-                raw_df
-            )
-
-            feature_df = extract_window_features(
-                cleaned_df,
-                window_size=128,
-            )
-
-            feature_df = validate_feature_table(feature_df)
-
-            st.session_state["raw_data"] = raw_df
-            st.session_state["cleaned_data"] = cleaned_df
-            st.session_state["data_report"] = {
-                "initial": initial_report,
-                "cleaning": cleaning_report,
-            }
-            st.session_state["feature_table"] = feature_df
-            st.session_state["loaded_source"] = source_description
-
-            clear_experiment_results()
-
-        st.success(
-            f"Loaded {len(raw_df):,} raw rows and extracted "
-            f"{len(feature_df):,} valid windows."
-        )
-
-    except Exception as error:
-        show_exception(error)
-
-
-raw_df = st.session_state["raw_data"]
-cleaned_df = st.session_state["cleaned_data"]
-feature_df = st.session_state["feature_table"]
-
-if raw_df is None or cleaned_df is None or feature_df is None:
-    st.info(
-        "Select your dataset folder in the sidebar and click "
-        "**Load dataset** to begin."
-    )
+raw = st.session_state['raw_data']
+cleaned = st.session_state['cleaned_data']
+features = st.session_state['feature_table']
+if raw is None or cleaned is None or features is None:
+    st.info('Select a dataset and click **Load dataset** to start.')
     st.stop()
 
-
-# =========================================================
-# 6. TABS
-# No Feature Analysis tab.
-# =========================================================
-
-overview_tab, quality_tab, signals_tab, models_tab, downloads_tab = (
-    st.tabs(
-        [
-            "Overview",
-            "Data Quality",
-            "Raw Signals",
-            "Model Experiments",
-            "Downloads",
-        ]
-    )
-)
-
-
-# =========================================================
-# 7. OVERVIEW
-# =========================================================
+(overview_tab, quality_tab, eda_tab, signals_tab, models_tab, comparison_tab, downloads_tab) = st.tabs([
+    '📊 Overview', '🧹 Data Quality', '🔎 Exploratory Analysis',
+    '📈 Raw Signals', '🤖 ML Experiments', '🏆 Model Comparison', '📥 Downloads'
+])
+activities = sorted(cleaned['activity'].astype(str).unique().tolist())
 
 with overview_tab:
-    st.header("Dataset overview")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Raw samples", f"{len(raw_df):,}")
-    col2.metric("Cleaned samples", f"{len(cleaned_df):,}")
-    col3.metric("Valid windows", f"{len(feature_df):,}")
-    col4.metric(
-        "Activity classes",
-        cleaned_df["activity"].nunique(),
-    )
-
-    st.write(
-        "**Dataset source:**",
-        st.session_state["loaded_source"],
-    )
-
-    st.subheader("Experimental workflow")
-
-    st.markdown(
-        """
-        1. Load and clean Shimmer recordings.
-        2. Inspect data quality and raw signals.
-        3. Extract 12 baseline statistical features from each
-           128-sample accelerometer window.
-        4. Tune and evaluate KNN, SVM, and Decision Tree.
-        5. Compare repeated-split performance and download results.
-        """
-    )
-
-    st.subheader("Samples per activity")
-
-    counts = make_activity_counts(cleaned_df)
-
-    if not counts.empty:
-        st.bar_chart(
-            counts.set_index("Activity")["Samples"],
-            width="stretch",
-        )
-
-        st.dataframe(
-            counts,
-            width="stretch",
-            hide_index=True,
-        )
-
-    st.subheader("Windows per activity")
-
-    window_counts = (
-        feature_df["activity"]
-        .value_counts()
-        .sort_index()
-        .rename_axis("Activity")
-        .reset_index(name="Windows")
-    )
-
-    st.dataframe(
-        window_counts,
-        width="stretch",
-        hide_index=True,
-    )
-
-    st.caption(
-        "Only complete 128-sample windows are retained. "
-        "Incomplete trailing samples are discarded."
-    )
-
-
-# =========================================================
-# 8. DATA QUALITY
-# =========================================================
+    st.header('Dataset overview')
+    a, b, c, d = st.columns(4)
+    a.metric('Raw samples', f'{len(raw):,}')
+    b.metric('Cleaned samples', f'{len(cleaned):,}')
+    c.metric('Valid windows', f'{len(features):,}')
+    d.metric('Activity classes', len(activities))
+    st.write('**Dataset source:**', st.session_state['loaded_source'])
+    show_plot(eda.activity_counts(cleaned, features), 'overview_activity_counts.png')
+    show_plot(eda.class_proportions(cleaned), 'overview_activity_proportions.png')
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader('Samples per activity')
+        st.dataframe(cleaned['activity'].astype(str).value_counts().sort_index().rename_axis('Activity').reset_index(name='Samples'), hide_index=True, width='stretch')
+    with c2:
+        st.subheader('Windows per activity')
+        st.dataframe(features['activity'].astype(str).value_counts().sort_index().rename_axis('Activity').reset_index(name='Windows'), hide_index=True, width='stretch')
+    st.caption('Window duration is approximately 2.56 seconds only if the sampling rate is 50 Hz. Incomplete trailing windows are excluded.')
 
 with quality_tab:
-    st.header("Data quality and preprocessing")
+    st.header('Data quality & timestamp diagnostics')
+    st.dataframe(quality_summary(raw, cleaned), hide_index=True, width='stretch')
+    q1, q2 = st.columns(2)
+    with q1:
+        show_plot(eda.missing_values(raw), 'quality_missing_raw.png')
+    with q2:
+        show_plot(eda.missing_values(cleaned), 'quality_missing_cleaned.png')
+    show_plot(eda.missing_pattern(raw), 'quality_missing_pattern.png',
+              'A sampled-row map: black indicates missing data. Sampling is for display only.')
+    if {'timestamp', 'source_file'}.issubset(raw.columns):
+        st.subheader('Timestamp analysis')
+        st.dataframe(timestamp_summary(raw), hide_index=True, width='stretch')
+        source = st.selectbox('Source recording for timestamp plots',
+                              sorted(raw['source_file'].astype(str).unique()), key='quality_source')
+        show_plot(eda.timestamp_differences(raw, source), 'quality_timestamp_differences.png')
+        st.warning('Timestamp units have not been verified. Gaps are diagnostic, not automatically treated as recording boundaries.')
+    st.subheader('Preprocessing reports')
+    st.json(st.session_state['data_report'])
 
-    st.subheader("Before and after cleaning")
-
-    quality_df = make_quality_report(raw_df, cleaned_df)
-
-    st.dataframe(
-        quality_df,
-        width="stretch",
-        hide_index=True,
-    )
-
-    st.subheader("Missing values after cleaning")
-
-    missing_counts = (
-        cleaned_df.isna()
-        .sum()
-        .rename_axis("Column")
-        .reset_index(name="Missing values")
-    )
-
-    st.dataframe(
-        missing_counts,
-        width="stretch",
-        hide_index=True,
-    )
-
-    st.subheader("Duplicate rows")
-
-    st.write(
-        "Duplicate rows in cleaned data:",
-        int(cleaned_df.duplicated().sum()),
-    )
-
-    st.caption(
-        "Repeated sensor readings are not automatically deleted. "
-        "Their meaning should be checked against the dataset documentation."
-    )
-
-    st.subheader("Timestamp checks")
-
-    timestamp_report = make_timestamp_report(raw_df)
-
-    if timestamp_report.empty:
-        st.info("No timestamp column is available.")
+with eda_tab:
+    st.header('Exploratory data analysis')
+    st.caption('Raw accelerometer distribution plots do not change the 12-feature classical ML baseline.')
+    axis = st.selectbox('Accelerometer axis', eda.AXES, key='eda_axis')
+    chosen = st.multiselect('Activities to compare', activities, default=activities, key='eda_classes')
+    if chosen:
+        c1, c2 = st.columns(2)
+        with c1:
+            show_plot(eda.axis_distributions(cleaned, axis, chosen, kind='hist'), 'eda_histogram.png')
+        with c2:
+            try:
+                show_plot(eda.axis_distributions(cleaned, axis, chosen, kind='kde'), 'eda_density.png')
+            except (ValueError, TypeError, np.linalg.LinAlgError):
+                st.info('Density curve unavailable for this selection (insufficient variation).')
+        selected = cleaned[cleaned['activity'].astype(str).isin(chosen)]
+        c3, c4 = st.columns(2)
+        with c3:
+            show_plot(eda.activity_boxplot(selected, axis, kind='box'), 'eda_boxplot.png')
+        with c4:
+            show_plot(eda.activity_boxplot(selected, axis, kind='violin'), 'eda_violin.png')
+        st.caption('Plots may use fixed-seed subsamples for responsiveness. They describe sensor distributions, not feature importance.')
     else:
-        st.dataframe(
-            timestamp_report,
-            width="stretch",
-            hide_index=True,
-        )
-
-    st.warning(
-        "Timestamp differences are descriptive only. Verify the "
-        "timestamp units and acquisition behavior before interpreting "
-        "gaps as recording boundaries."
-    )
-
-    st.subheader("Preprocessing report")
-
-    reports = st.session_state.get("data_report")
-
-    if reports is not None:
-        st.json(
-            {
-                "initial_report": str(reports["initial"]),
-                "cleaning_report": str(reports["cleaning"]),
-            }
-        )
-
-
-# =========================================================
-# 9. RAW SIGNALS
-# =========================================================
+        st.info('Select at least one activity.')
 
 with signals_tab:
-    st.header("Raw accelerometer signals")
-
-    st.write(
-        "Inspect the first 1,000 samples of each activity."
-    )
-
-    available_activities = sorted(
-        cleaned_df["activity"].astype(str).unique()
-    )
-
-    selected_activity = st.selectbox(
-        "Select activity",
-        options=available_activities,
-    )
-
-    activity_data = cleaned_df[
-        cleaned_df["activity"].astype(str) == selected_activity
-    ].copy()
-
-    available_files = sorted(
-        activity_data["source_file"].astype(str).unique()
-    )
-
-    selected_file = st.selectbox(
-        "Select source recording",
-        options=available_files,
-    )
-
-    signal_data = activity_data[
-        activity_data["source_file"].astype(str) == selected_file
-    ].copy()
-
-    signal_data = signal_data.sort_values(
-        "sample_index",
-        kind="stable",
-    ).head(1000)
-
-    if signal_data.empty:
-        st.warning("No samples are available for this selection.")
-
+    st.header('Raw accelerometer signals')
+    activity = st.selectbox('Activity', activities, key='signal_activity')
+    activity_rows = cleaned[cleaned['activity'].astype(str).eq(activity)]
+    files = sorted(activity_rows['source_file'].astype(str).unique())
+    source = st.selectbox('Source recording', files, key='signal_file')
+    n_samples = st.slider('Number of samples', 128, 3000, 1000, 128)
+    sub = activity_rows[activity_rows['source_file'].astype(str).eq(source)].sort_values('sample_index', kind='stable').head(n_samples).copy()
+    if sub.empty:
+        st.warning('No signal rows for this selection.')
     else:
-        fig, axes = plt.subplots(
-            3,
-            1,
-            figsize=(13, 9),
-            sharex=True,
-        )
-
-        x_values = signal_data["sample_index"].to_numpy()
-
-        signal_columns = [
-            ("accel_x", "Accelerometer X"),
-            ("accel_y", "Accelerometer Y"),
-            ("accel_z", "Accelerometer Z"),
-        ]
-
-        for ax, (column, title) in zip(axes, signal_columns):
-            if column not in signal_data.columns:
-                ax.set_title(f"{title}: column unavailable")
-                continue
-
-            values = pd.to_numeric(
-                signal_data[column],
-                errors="coerce",
-            )
-
-            ax.plot(
-                x_values,
-                values,
-                linewidth=0.8,
-            )
-
-            ax.set_title(title)
-            ax.set_ylabel("Value")
-            ax.grid(True, alpha=0.3)
-
-        axes[-1].set_xlabel("Original sample index")
+        fig, axs = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
+        xyz = sub[eda.AXES].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+        magnitude = np.sqrt(np.sum(xyz ** 2, axis=1))
+        x = sub['sample_index'].to_numpy()
+        for idx, axis_name in enumerate(eda.AXES):
+            axs[idx].plot(x, xyz[:, idx], lw=.85)
+            axs[idx].set_ylabel(axis_name)
+            axs[idx].grid(alpha=.3)
+        axs[3].plot(x, magnitude, lw=.85)
+        axs[3].set_ylabel('Magnitude')
+        axs[3].set_xlabel('Original sample index')
+        axs[3].grid(alpha=.3)
+        fig.suptitle(f'{activity} — {source}')
         fig.tight_layout()
-
-        st.pyplot(fig, width="stretch")
-        plt.close(fig)
-
-        st.caption(
-            f"Showing {len(signal_data):,} samples from "
-            f"{selected_file}."
-        )
-
-        # FIXED: figure_to_png_bytes is defined above this code.
-        st.download_button(
-            "Download signal plot (PNG)",
-            data=figure_to_png_bytes(signal_data),
-            file_name=(
-                f"{selected_activity}_raw_signals.png"
-            ),
-            mime="image/png",
-            width="stretch",
-        )
-
-    st.subheader("Sample data")
-
-    st.dataframe(
-        signal_data.head(20),
-        width="stretch",
-        hide_index=True,
-    )
-
-
-# =========================================================
-# 10. MODEL EXPERIMENTS
-# =========================================================
+        show_plot(fig, 'raw_signal_xyz_magnitude.png', 'Magnitude = √(X² + Y² + Z²). Used for visualization only.')
+        st.dataframe(sub.head(20), hide_index=True, width='stretch')
+    st.divider()
+    st.subheader('Compare activities')
+    compared = st.multiselect('Choose activities', activities,
+                              default=activities[:min(2, len(activities))], key='signal_compare')
+    compare_axis = st.selectbox('Signal to compare', [*eda.AXES, 'magnitude'], key='signal_compare_axis')
+    if compared:
+        show_plot(eda.signal_comparison(cleaned, compared, compare_axis, samples=n_samples),
+                  'activity_signal_comparison.png',
+                  'Each activity uses the first available recording; these are descriptive signal comparisons.')
 
 with models_tab:
-    st.header("Classical machine-learning experiments")
-
-    st.markdown(
-        """
-        The models use the same repeated stratified train/test splits.
-
-        Hyperparameters are tuned using cross-validation on the
-        training partition only. The held-out test partition is
-        not used for tuning.
-        """
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Repeated runs", int(n_runs))
-    col2.metric("Test proportion", f"{test_size:.0%}")
-    col3.metric("CV folds", int(inner_cv_splits))
-
-    st.warning(
-        "Evaluation limitation: random splitting of windows can put "
-        "related samples from the same recording into both training "
-        "and test sets. This may inflate performance estimates. "
-        "Discuss recording-aware validation with your supervisor."
-    )
-
-    signature = (
-        len(feature_df),
-        tuple(feature_df.columns),
-        int(n_runs),
-        float(test_size),
-        int(random_state),
-        int(inner_cv_splits),
-    )
-
-    if (
-        st.session_state["experiment_signature"] is not None
-        and st.session_state["experiment_signature"] != signature
-    ):
-        st.info(
-            "The settings changed. Run the experiments again "
-            "to update the results."
-        )
-
-    run_clicked = st.button(
-        "Run model experiments",
-        type="primary",
-        width="stretch",
-    )
-
-    if run_clicked:
+    st.header('Classical machine learning experiments')
+    st.markdown('KNN, SVM and Decision Tree use matched stratified random splits. Hyperparameters are tuned **only on training windows**.')
+    c1, c2, c3 = st.columns(3)
+    c1.metric('Runs', int(runs))
+    c2.metric('Test proportion', f'{test_size:.0%}')
+    c3.metric('CV folds', int(folds))
+    st.warning('Window-level splits may mix related windows from the same recording across train and test, potentially inflating performance.')
+    signature = (len(features), tuple(features.columns), int(runs), float(test_size), int(seed), int(folds))
+    if st.session_state['experiment_output'] is not None and st.session_state['experiment_signature'] != signature:
+        st.warning('Settings changed. Previous results are displayed until you run experiments again.')
+    if st.button('Run model experiments', type='primary', width='stretch'):
         try:
-            start_time = time.perf_counter()
+            start = time.perf_counter()
+            with st.spinner('Running nested tuning and repeated evaluations...'):
+                result = repeated_random_split_experiments(feature_df=features,
+                    n_runs=int(runs), test_size=float(test_size),
+                    random_state=int(seed), inner_cv_splits=int(folds))
+            st.session_state['experiment_output'] = result
+            st.session_state['experiment_signature'] = signature
+            st.success(f'Experiments completed in {time.perf_counter()-start:.1f} seconds.')
+        except Exception as exc:
+            st.session_state['experiment_output'] = None
+            st.session_state['experiment_signature'] = None
+            show_error(exc)
+    result = st.session_state['experiment_output']
+    if result is not None:
+        st.subheader('Model summary')
+        st.dataframe(result['summary'].round(4), hide_index=True, width='stretch')
+        st.subheader('Per-run results')
+        st.dataframe(result['results'].round(4), hide_index=True, width='stretch')
+        st.subheader('Selected hyperparameters')
+        st.dataframe(result['best_parameters'], hide_index=True, width='stretch')
+        if 'final_model_parameters' in result:
+            with st.expander('Final model parameters (trained on all windows)'):
+                st.dataframe(result['final_model_parameters'], hide_index=True, width='stretch')
+        st.info(result.get('evaluation_note', 'Repeated splits are not independent held-out recordings.'))
+        st.caption('See the Model Comparison tab for all interactive performance charts.')
 
-            with st.spinner(
-                "Tuning and evaluating KNN, SVM, and Decision Tree..."
-            ):
-                output = repeated_random_split_experiments(
-                    feature_df=feature_df,
-                    n_runs=int(n_runs),
-                    test_size=float(test_size),
-                    random_state=int(random_state),
-                    inner_cv_splits=int(inner_cv_splits),
-                )
-
-            elapsed = time.perf_counter() - start_time
-
-            st.session_state["experiment_output"] = output
-            st.session_state["experiment_signature"] = signature
-
-            st.success(
-                f"Completed {n_runs} runs for all three models "
-                f"in {elapsed:.1f} seconds."
-            )
-
-        except Exception as error:
-            st.session_state["experiment_output"] = None
-            show_exception(error)
-
-    output = st.session_state.get("experiment_output")
-
-    if output is not None:
+with comparison_tab:
+    st.header('Interactive model comparison')
+    result = st.session_state['experiment_output']
+    if result is None:
+        st.info('Run the experiments in **ML Experiments** to populate comparison charts.')
+    else:
+        summary = result['summary']
+        per_run = result['results']
+        st.subheader('Comparison across all metrics')
+        show_plot(mv.metric_means(summary), 'models_all_metrics.png')
+        show_plot(mv.metrics_heatmap(summary), 'models_metric_heatmap.png')
+        metric = st.selectbox('Choose evaluation metric', list(mv.METRICS),
+                              format_func=lambda m: mv.METRICS[m], key='comparison_metric')
+        show_plot(mv.metric_errorbars(summary, metric), f'models_{metric}_errorbars.png',
+                  'Error bars show standard deviation across repeated splits (not confidence intervals).')
+        a, b = st.columns(2)
+        with a:
+            show_plot(mv.run_distributions(per_run, metric, kind='box'), f'models_{metric}_boxplot.png')
+        with b:
+            show_plot(mv.run_distributions(per_run, metric, kind='violin'), f'models_{metric}_violin.png')
+        show_plot(mv.run_lines(per_run, metric), f'models_{metric}_runs.png')
+        if 'mean_tuning_and_fit_seconds' in summary.columns:
+            show_plot(mv.runtime_chart(summary), 'models_runtime.png')
         st.divider()
-
-        st.subheader("Model comparison")
-
-        summary_df = output["summary"]
-
-        display_columns = [
-            "model",
-            "accuracy_mean",
-            "accuracy_std",
-            "balanced_accuracy_mean",
-            "balanced_accuracy_std",
-            "precision_weighted_mean",
-            "recall_weighted_mean",
-            "f1_weighted_mean",
-            "f1_weighted_std",
-            "f1_macro_mean",
-            "mcc_mean",
-            "mcc_std",
-            "mean_tuning_and_fit_seconds",
-        ]
-
-        display_columns = [
-            column
-            for column in display_columns
-            if column in summary_df.columns
-        ]
-
-        st.dataframe(
-            summary_df[display_columns].round(4),
-            width="stretch",
-            hide_index=True,
-        )
-
-        st.subheader("Balanced accuracy")
-
-        st.bar_chart(
-            summary_df.set_index("model")[
-                ["balanced_accuracy_mean"]
-            ],
-            width="stretch",
-        )
-
-        st.subheader("Weighted F1-score")
-
-        st.bar_chart(
-            summary_df.set_index("model")[
-                ["f1_weighted_mean"]
-            ],
-            width="stretch",
-        )
-
-        st.subheader("Per-run results")
-
-        st.dataframe(
-            output["results"],
-            width="stretch",
-            hide_index=True,
-        )
-
-        st.subheader("Selected hyperparameters")
-
-        st.dataframe(
-            output["best_parameters"],
-            width="stretch",
-            hide_index=True,
-        )
-
-        st.subheader("Confusion matrices")
-
-        st.caption(output["confusion_matrix_note"])
-
-        selected_model = st.selectbox(
-            "Select model",
-            options=list(output["confusion_matrices"].keys()),
-        )
-
-        labels = output["confusion_matrix_labels"]
-        matrix = output["confusion_matrices"][selected_model]
-
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            fig = make_confusion_matrix_figure(
-                matrix,
-                labels,
-                f"{selected_model} — accumulated counts",
-                normalize=False,
-            )
-            st.pyplot(fig, width="stretch")
-            plt.close(fig)
-
-        with col_b:
-            fig = make_confusion_matrix_figure(
-                matrix,
-                labels,
-                f"{selected_model} — normalized",
-                normalize=True,
-            )
-            st.pyplot(fig, width="stretch")
-            plt.close(fig)
-
-        st.subheader("Per-class performance")
-
-        per_class_df = output["per_class_metrics"]
-
-        per_class_summary = (
-            per_class_df
-            .groupby(["model", "class"], as_index=False)
-            .agg(
-                precision_mean=("precision", "mean"),
-                recall_mean=("recall", "mean"),
-                f1_mean=("f1_score", "mean"),
-            )
-        )
-
-        st.dataframe(
-            per_class_summary.round(4),
-            width="stretch",
-            hide_index=True,
-        )
-
-        st.subheader("Evaluation limitations")
-
-        st.write(output["evaluation_note"])
-
-        st.caption(
-            "Final models are fitted on all available windows after "
-            "evaluation. They are intended for future predictions, "
-            "not for estimating generalization performance."
-        )
-
-
-# =========================================================
-# 11. DOWNLOADS
-# =========================================================
+        st.subheader('Confusion matrices')
+        st.caption(result.get('confusion_matrix_note', 'Counts accumulated across repeated test splits; some windows appear more than once.'))
+        model = st.selectbox('Model', list(result['confusion_matrices']), key='comparison_model')
+        matrix = result['confusion_matrices'][model]
+        labels = result['confusion_matrix_labels']
+        a, b = st.columns(2)
+        with a:
+            show_plot(confusion_plot(matrix, labels, model, False), 'confusion_counts.png')
+        with b:
+            show_plot(confusion_plot(matrix, labels, model, True), 'confusion_normalized.png')
+        st.divider()
+        st.subheader('Per-class comparison')
+        per_class = result['per_class_metrics']
+        class_metric = st.selectbox('Per-class metric', ['precision', 'recall', 'f1_score'], key='comparison_class_metric')
+        show_plot(mv.per_class_heatmap(per_class, class_metric), f'per_class_{class_metric}.png')
+        st.dataframe(per_class.groupby(['model', 'class'], as_index=False)[['precision', 'recall', 'f1_score']].mean().round(4),
+                     hide_index=True, width='stretch')
+        st.subheader('Hyperparameter selection')
+        show_plot(mv.parameter_frequency(result['best_parameters']), 'models_parameter_frequency.png')
+        st.caption('The repeated train/test splits overlap. These plots show variability across random splits, not independent-study uncertainty.')
 
 with downloads_tab:
-    st.header("Download project outputs")
-
-    st.subheader("Data")
-
-    st.download_button(
-        "Download cleaned raw data",
-        data=dataframe_to_csv(cleaned_df),
-        file_name="shimmer_cleaned_data.csv",
-        mime="text/csv",
-        width="stretch",
-    )
-
-    st.download_button(
-        "Download baseline features",
-        data=dataframe_to_csv(feature_df),
-        file_name="shimmer_baseline_features.csv",
-        mime="text/csv",
-        width="stretch",
-    )
-
-    output = st.session_state.get("experiment_output")
-
-    if output is None:
-        st.info(
-            "Run the experiments to enable result downloads."
-        )
-
+    st.header('Download data and experiment results')
+    st.download_button('Cleaned data (CSV)', csv_bytes(cleaned), 'shimmer_cleaned_data.csv', 'text/csv')
+    st.download_button('Baseline features (CSV)', csv_bytes(features), 'shimmer_baseline_features.csv', 'text/csv')
+    result = st.session_state['experiment_output']
+    if result is None:
+        st.info('Run experiments to enable ML result downloads. Each chart also has its own PNG download button in its tab.')
     else:
-        st.subheader("Experiment results")
-
-        st.download_button(
-            "Download per-run metrics",
-            data=dataframe_to_csv(output["results"]),
-            file_name="model_experiment_results.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-        st.download_button(
-            "Download model summary",
-            data=dataframe_to_csv(output["summary"]),
-            file_name="model_summary.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-        st.download_button(
-            "Download best hyperparameters",
-            data=dataframe_to_csv(output["best_parameters"]),
-            file_name="best_hyperparameters.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-        st.download_button(
-            "Download per-class metrics",
-            data=dataframe_to_csv(output["per_class_metrics"]),
-            file_name="per_class_metrics.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-        for model_name, matrix in output[
-            "confusion_matrices"
-        ].items():
-            matrix_df = pd.DataFrame(
-                matrix,
-                index=output["confusion_matrix_labels"],
-                columns=output["confusion_matrix_labels"],
-            )
-
-            matrix_df.index.name = "True activity"
-
-            st.download_button(
-                f"Download {model_name} confusion matrix",
-                data=dataframe_to_csv(
-                    matrix_df.reset_index()
-                ),
-                file_name=(
-                    f"{model_name.lower().replace(' ', '_')}_"
-                    "confusion_matrix.csv"
-                ),
-                mime="text/csv",
-                width="stretch",
-                key=f"download_cm_{model_name}",
-            )
+        for key, filename in [('results', 'per_run_results.csv'), ('summary', 'model_summary.csv'),
+                              ('best_parameters', 'best_hyperparameters.csv'),
+                              ('per_class_metrics', 'per_class_metrics.csv'),
+                              ('final_model_parameters', 'final_model_parameters.csv')]:
+            if key in result and isinstance(result[key], pd.DataFrame):
+                st.download_button(f'{key.replace("_", " ").title()} (CSV)', csv_bytes(result[key]),
+                                   filename, 'text/csv', key=f'download_{key}')
+        for model, matrix in result['confusion_matrices'].items():
+            cm = pd.DataFrame(matrix, index=result['confusion_matrix_labels'], columns=result['confusion_matrix_labels'])
+            cm.index.name = 'True activity'
+            st.download_button(f'{model} confusion matrix (CSV)', csv_bytes(cm.reset_index()),
+                               f'{str(model).lower().replace(" ", "_")}_confusion_matrix.csv',
+                               'text/csv', key=f'download_cm_{model}')

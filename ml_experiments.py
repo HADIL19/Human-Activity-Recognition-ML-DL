@@ -482,10 +482,9 @@ def repeated_random_split_experiments(
 
     X, y, label_encoder = prepare_dataset(feature_df)
 
-    class_counts = np.bincount(np.asarray(y, dtype=np.int64))
     n_classes = len(label_encoder.classes_)
 
-    n_samples = int(class_counts.sum())
+    n_samples = len(y)
     n_test = int(np.ceil(n_samples * test_size))
     n_train = n_samples - n_test
 
