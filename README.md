@@ -115,7 +115,9 @@ The three accelerometer axes are used:
 
 Continuous sensor signals are divided into non-overlapping windows of **128 samples**.
 
-At a nominal sampling frequency of 50 Hz, each window represents approximately **2.56 seconds** of activity. The actual sampling frequency should be confirmed from the recording timestamps.
+Windows are built only within continuous runs: missing sample indices, non-increasing timestamps, and timestamp steps over 1.5 times the recording's median positive step start a new run. This prevents windows from crossing timestamp resets or acquisition gaps; incomplete run tails are dropped.
+
+The supplied MAT recordings contain a timestamp followed by accelerometer X, Y, and Z in columns 2-4; later sensor channels are not used for baseline features. The observed median timestamp step is about **19.53 timestamp units**. If those units are milliseconds, that corresponds to approximately 51.2 Hz and a 128-sample window is about 2.50 seconds. The physical timestamp unit should be confirmed before reporting duration in seconds.
 
 Each window is transformed into a feature vector for classification.
 
@@ -192,31 +194,22 @@ The following metrics are calculated:
 | Weighted Recall | Recall accounting for class support |
 | Weighted F1-score | F1-score accounting for class support |
 | Macro F1-score | Average F1-score across classes |
+| Macro AUC-ROC (one-vs-rest) | Mean area under the ROC curve across activity classes |
 | Matthews Correlation Coefficient | Correlation-based classification metric |
 | Confusion Matrix | Visualization of classification errors |
 | Runtime | Model training and evaluation time |
 
-Results are summarized using the mean and standard deviation across repeated experiments.
+Results are summarized using the mean and standard deviation across repeated experiments. The dashboard also reports corrected resampled t-tests for balanced accuracy: each model versus the 1/number-of-classes chance level, plus pairwise model comparisons. Holm adjustment is applied across the six tests.
+
+These p-values are approximate because repeated random splits reuse observations, and windows from one recording may appear in both training and test partitions. Treat them as exploratory evidence. A recording-aware or participant-aware evaluation is needed before making strong generalization claims.
 
 **Evaluation limitation:** Repeated random splits can contain overlapping test observations. Therefore, aggregated confusion matrices represent predictions across repetitions rather than independent observations. Window-level random splitting may also overestimate generalization when windows originate from the same recording.
 
 ## Results
 
-Mean ± standard deviation over 10 repeated stratified train/test splits:
+Run the dashboard experiments on the selected dataset and settings to produce current metrics, confidence summaries, and p-values. The earlier fixed score table was removed because correcting window segmentation at timestamp discontinuities changes the feature set, making those scores outdated.
 
-| Model | Accuracy | Balanced accuracy | Weighted F1 | Macro F1 | MCC | Mean tuning + fit time (s) |
-|---|---|---|---|---|---|---|
-| **KNN** | **0.9621** ± 0.0089 | **0.9297** ± 0.0240 | **0.9613** ± 0.0094 | **0.9434** | **0.9545** ± 0.0107 | 1.58 |
-| Decision Tree | 0.9300 ± 0.0139 | 0.9165 ± 0.0189 | 0.9299 ± 0.0142 | 0.9145 | 0.9159 ± 0.0165 | 2.52 |
-| SVM | 0.8842 ± 0.0086 | 0.8938 ± 0.0168 | 0.8825 ± 0.0092 | 0.8955 | 0.8613 ± 0.0103 | **0.78** |
-
-**Main observations**
-
-- KNN scores highest on every quality metric, and it has the highest accuracy in all ten splits. SVM is the lowest in all ten, but it is the fastest to tune and fit.
-- For KNN and the Decision Tree, balanced accuracy and macro F1 are lower than overall accuracy, which points to weaker recognition of some minority classes (Fall is the smallest class). SVM shows the opposite pattern.
-- Run-to-run variation is small compared with the gaps between models, so the ranking KNN > Decision Tree > SVM is stable across splits.
-
-**Interpretation note:** these scores come from random window-level splits (see the evaluation limitation above), so they are likely optimistic compared with performance on unseen recordings or participants. A recording-aware or participant-aware split is the planned next step.
+For the seven supplied MAT recordings, the corrected pipeline produces **1,856 complete windows**: Fall 44, Jump 138, Lay 318, Run 279, Sit 334, Stand 397, and Walk 346. Fall remains the smallest class, so report per-class recall and MCC alongside accuracy.
 
 ## Interactive Streamlit Dashboard
 
@@ -238,7 +231,8 @@ The project includes an interactive application built with Streamlit.
 **Raw Signals**
 - Visualization of accelerometer signals
 - Activity selection
-- Visualization of the first 1,000 samples
+- Grid of the first 1,000 samples for every activity across X, Y, and Z
+- Elapsed timestamp-based horizontal axis; timestamp resets and large gaps are compressed for plotting
 - Export of signal plots
 
 **Model Experiments**
@@ -246,6 +240,7 @@ The project includes an interactive application built with Streamlit.
 - Configurable experimental settings
 - Hyperparameter optimization
 - Performance metrics
+- Corrected resampled significance tests and Holm-adjusted p-values
 - Confusion matrices
 - Per-class evaluation
 

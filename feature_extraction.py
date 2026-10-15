@@ -20,6 +20,7 @@ import pandas as pd
 
 
 DEFAULT_WINDOW_SIZE = 128
+TIMESTAMP_GAP_FACTOR = 1.5
 
 AXES = {
     "x": "accel_x",
@@ -123,6 +124,24 @@ def _has_consecutive_indices(group):
         return True
 
     return bool(np.all(np.diff(indices) == 1))
+
+
+def _continuous_run_slices(group):
+    """Split rows at missing indices and timestamp discontinuities."""
+    indices = pd.to_numeric(group["sample_index"], errors="coerce").to_numpy(dtype=float)
+    breaks = set((np.flatnonzero(np.diff(indices) != 1) + 1).tolist())
+
+    if "timestamp" in group.columns:
+        timestamps = pd.to_numeric(group["timestamp"], errors="coerce").to_numpy(dtype=float)
+        deltas = np.diff(timestamps)
+        positive = deltas[np.isfinite(deltas) & (deltas > 0)]
+        time_break_mask = ~np.isfinite(deltas) | (deltas <= 0)
+        if len(positive):
+            median_delta = float(np.median(positive))
+            time_break_mask |= deltas > TIMESTAMP_GAP_FACTOR * median_delta
+        breaks.update((np.flatnonzero(time_break_mask) + 1).tolist())
+
+    return np.split(np.arange(len(group)), sorted(breaks))
 
 
 def extract_window_features(
@@ -229,11 +248,8 @@ def extract_window_features(
             kind="stable",
         )
 
-        # Do not bridge missing indices. Split into uninterrupted runs.
-        indices = group["sample_index"].to_numpy(dtype=float)
-        breaks = np.flatnonzero(np.diff(indices) != 1) + 1
-
-        runs = np.split(np.arange(len(group)), breaks)
+        # Do not bridge missing indices or timestamps that reset/jump.
+        runs = _continuous_run_slices(group)
 
         for run_indices in runs:
             run = group.iloc[run_indices]

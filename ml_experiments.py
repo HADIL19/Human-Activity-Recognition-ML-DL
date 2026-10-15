@@ -33,6 +33,7 @@ from sklearn.base import clone
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
+    roc_auc_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
@@ -52,6 +53,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
+from scipy.stats import t as student_t
 
 
 # Must match feature_extraction.py.
@@ -77,8 +79,12 @@ METRIC_COLUMNS = [
     "recall_weighted",
     "f1_weighted",
     "f1_macro",
+    "auc_roc_macro_ovr",
     "mcc",
 ]
+
+# Keep nested grid searches responsive on desktop Streamlit runs.
+GRID_SEARCH_N_JOBS = 2
 
 
 def prepare_dataset(feature_df):
@@ -157,6 +163,7 @@ def build_models(random_state=42):
                     "classifier",
                     SVC(
                         class_weight="balanced",
+                        probability=True,
                         random_state=random_state,
                     ),
                 ),
@@ -206,10 +213,10 @@ def build_parameter_grids():
     }
 
 
-def calculate_metrics(y_true, y_pred):
+def calculate_metrics(y_true, y_pred, y_score=None):
     """Calculate classification metrics."""
 
-    return {
+    metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "precision_weighted": precision_score(
@@ -238,6 +245,115 @@ def calculate_metrics(y_true, y_pred):
         ),
         "mcc": matthews_corrcoef(y_true, y_pred),
     }
+    if y_score is not None:
+        if len(np.unique(y_true)) == 2:
+            metrics["auc_roc_macro_ovr"] = roc_auc_score(y_true, y_score[:, 1])
+        else:
+            metrics["auc_roc_macro_ovr"] = roc_auc_score(
+                y_true,
+                y_score,
+                labels=np.arange(y_score.shape[1]),
+                multi_class="ovr",
+                average="macro",
+            )
+    return metrics
+
+
+def _corrected_resampled_t_test(differences, test_train_ratio, alternative):
+    """Return a Nadeau-Bengio corrected repeated-holdout t statistic."""
+    differences = np.asarray(differences, dtype=float)
+    n = len(differences)
+    if n < 2:
+        raise ValueError("At least two repeated splits are required for inference.")
+
+    mean_difference = float(np.mean(differences))
+    sample_variance = float(np.var(differences, ddof=1))
+    standard_error = float(np.sqrt((1 / n + test_train_ratio) * sample_variance))
+    degrees_of_freedom = n - 1
+
+    if standard_error == 0:
+        statistic = 0.0 if mean_difference == 0 else float(np.sign(mean_difference) * np.inf)
+        if mean_difference == 0:
+            p_value = 1.0
+        elif alternative == "greater":
+            p_value = 0.0 if mean_difference > 0 else 1.0
+        else:
+            p_value = 0.0
+    else:
+        statistic = mean_difference / standard_error
+        if alternative == "greater":
+            p_value = float(student_t.sf(statistic, degrees_of_freedom))
+        else:
+            p_value = float(2 * student_t.sf(abs(statistic), degrees_of_freedom))
+
+    critical_value = float(student_t.ppf(0.975, degrees_of_freedom))
+    return statistic, standard_error, p_value, critical_value, degrees_of_freedom
+
+
+def _holm_adjust(p_values):
+    """Holm-Bonferroni adjustment, preserving the input order."""
+    p_values = np.asarray(p_values, dtype=float)
+    order = np.argsort(p_values)
+    adjusted = np.empty(len(p_values), dtype=float)
+    running_max = 0.0
+    for rank, index in enumerate(order):
+        running_max = max(running_max, (len(p_values) - rank) * p_values[index])
+        adjusted[index] = min(1.0, running_max)
+    return adjusted
+
+
+def _significance_tests(results_df, n_classes, test_size):
+    """Test balanced accuracy against chance and between models."""
+    metric = "balanced_accuracy"
+    test_train_ratio = test_size / (1 - test_size)
+    records = []
+
+    for model, group in results_df.groupby("model", sort=False):
+        scores = group[metric].to_numpy(dtype=float)
+        chance = 1.0 / n_classes
+        differences = scores - chance
+        statistic, standard_error, p_value, critical, df = (
+            _corrected_resampled_t_test(differences, test_train_ratio, "greater")
+        )
+        records.append({
+            "comparison": f"{model} vs chance ({chance:.4f})",
+            "test": "One-sided corrected resampled t-test",
+            "metric": metric,
+            "mean_difference": float(np.mean(differences)),
+            "corrected_standard_error": standard_error,
+            "t_statistic": statistic,
+            "degrees_of_freedom": df,
+            "p_value": p_value,
+            "ci_95_lower": float(np.mean(differences) - critical * standard_error),
+            "ci_95_upper": float(np.mean(differences) + critical * standard_error),
+        })
+
+    models = list(results_df["model"].drop_duplicates())
+    for left_index, model_a in enumerate(models):
+        scores_a = results_df.loc[results_df["model"] == model_a].sort_values("run")[metric].to_numpy(dtype=float)
+        for model_b in models[left_index + 1:]:
+            scores_b = results_df.loc[results_df["model"] == model_b].sort_values("run")[metric].to_numpy(dtype=float)
+            differences = scores_a - scores_b
+            statistic, standard_error, p_value, critical, df = (
+                _corrected_resampled_t_test(differences, test_train_ratio, "two-sided")
+            )
+            records.append({
+                "comparison": f"{model_a} vs {model_b}",
+                "test": "Two-sided corrected resampled t-test",
+                "metric": metric,
+                "mean_difference": float(np.mean(differences)),
+                "corrected_standard_error": standard_error,
+                "t_statistic": statistic,
+                "degrees_of_freedom": df,
+                "p_value": p_value,
+                "ci_95_lower": float(np.mean(differences) - critical * standard_error),
+                "ci_95_upper": float(np.mean(differences) + critical * standard_error),
+            })
+
+    table = pd.DataFrame(records)
+    table["p_value_holm"] = _holm_adjust(table["p_value"].to_numpy())
+    table["significant_at_0_05"] = table["p_value_holm"] < 0.05
+    return table
 
 
 def _make_cv(y, random_state, max_splits=5):
@@ -339,7 +455,7 @@ def _tune_and_fit(
         param_grid=safe_grid,
         scoring="balanced_accuracy",
         cv=cv,
-        n_jobs=-1,
+        n_jobs=GRID_SEARCH_N_JOBS,
         refit=True,
         error_score="raise",
     )
@@ -428,7 +544,7 @@ def _fit_final_models(
             param_grid=safe_grid,
             scoring="balanced_accuracy",
             cv=full_cv,
-            n_jobs=-1,
+            n_jobs=GRID_SEARCH_N_JOBS,
             refit=True,
             error_score="raise",
         )
@@ -541,11 +657,12 @@ def repeated_random_split_experiments(
 
                 prediction_start = time.perf_counter()
                 y_pred = fitted_model.predict(X_test)
+                y_score = fitted_model.predict_proba(X_test)
                 prediction_seconds = (
                     time.perf_counter() - prediction_start
                 )
 
-                metrics = calculate_metrics(y_test, y_pred)
+                metrics = calculate_metrics(y_test, y_pred, y_score=y_score)
 
                 results.append(
                     {
@@ -619,6 +736,11 @@ def repeated_random_split_experiments(
         "balanced_accuracy_mean",
         ascending=False,
     ).reset_index(drop=True)
+    significance_tests_df = _significance_tests(
+        results_df=results_df,
+        n_classes=n_classes,
+        test_size=test_size,
+    )
 
     per_class_df = pd.DataFrame(per_class_reports)
     best_parameters_df = pd.DataFrame(best_parameters)
@@ -640,6 +762,7 @@ def repeated_random_split_experiments(
     return {
         "results": results_df,
         "summary": summary_df,
+        "significance_tests": significance_tests_df,
         "confusion_matrices": confusion_matrices,
         "per_class_metrics": per_class_df,
         "best_parameters": best_parameters_df,
@@ -658,8 +781,10 @@ def repeated_random_split_experiments(
         "evaluation_note": (
             "Repeated stratified holdout results are useful for "
             "comparing models, but runs overlap and are not "
-            "statistically independent. If independent recording or "
-            "participant identifiers become available, use a "
-            "group-aware evaluation design."
+            "statistically independent. P-values use a corrected "
+            "resampled t-test and Holm adjustment, but remain "
+            "approximate with only 10 splits and window-level leakage. "
+            "If independent recording or participant identifiers "
+            "become available, use group-aware evaluation."
         ),
     }

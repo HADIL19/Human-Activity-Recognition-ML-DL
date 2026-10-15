@@ -6,6 +6,21 @@ import matplotlib.pyplot as plt
 AXES = ['accel_x', 'accel_y', 'accel_z']
 
 
+def elapsed_time_axis(sub):
+    """Build a monotone elapsed-time axis; compress timestamp resets/gaps."""
+    if 'timestamp' in sub.columns:
+        timestamps = pd.to_numeric(sub['timestamp'], errors='coerce').to_numpy(dtype=float)
+        if len(timestamps) and np.isfinite(timestamps).all():
+            deltas = np.diff(timestamps)
+            positive = deltas[deltas > 0]
+            median_step = float(np.median(positive)) if len(positive) else 1.0
+            continuous = np.isfinite(deltas) & (deltas > 0) & (deltas <= 1.5 * median_step)
+            elapsed_steps = np.where(continuous, deltas, median_step)
+            elapsed = np.concatenate(([0.0], np.cumsum(elapsed_steps)))
+            return elapsed, 'Accumulated timestamp units (gaps compressed)'
+    return np.arange(len(sub)), 'Sample position within recording'
+
+
 def _fig(w=11, h=5):
     fig, ax = plt.subplots(figsize=(w, h))
     return fig, ax
@@ -103,6 +118,7 @@ def activity_boxplot(df, axis='accel_x', kind='box', max_per_activity=3000):
 
 def signal_comparison(df, activities, axis='magnitude', samples=1000):
     fig, axs = plt.subplots(len(activities), 1, figsize=(13, max(3.5, len(activities)*2.6)), sharex=False, squeeze=False)
+    x_label = 'Sample position within recording'
     for ax, activity in zip(axs[:, 0], activities):
         sub = df[df['activity'].astype(str).eq(activity)]
         if 'source_file' in sub.columns and not sub.empty:
@@ -110,17 +126,50 @@ def signal_comparison(df, activities, axis='magnitude', samples=1000):
         if 'sample_index' in sub.columns:
             sub = sub.sort_values('sample_index', kind='stable')
         sub = sub.head(samples)
+        x, x_label = elapsed_time_axis(sub)
         if axis == 'magnitude':
             xyz = sub[AXES].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
             vals = np.sqrt(np.sum(xyz**2, axis=1))
         else:
             vals = pd.to_numeric(sub[axis], errors='coerce').to_numpy(dtype=float)
-        ax.plot(np.arange(len(vals)), vals, lw=.85)
+        ax.plot(x, vals, lw=.85)
         ax.set_title(activity)
         ax.set_ylabel(axis)
         ax.grid(alpha=.25)
-    axs[-1, 0].set_xlabel('Sample position within selected recording')
+    axs[-1, 0].set_xlabel(x_label)
     fig.suptitle('Activity signal comparison (first recording per activity)')
+    fig.tight_layout()
+    return fig
+
+
+def activity_signal_grid(df, activities, samples=1000):
+    """Plot the first samples from each activity for all three axes."""
+    fig, axs = plt.subplots(
+        len(activities), 3,
+        figsize=(15, max(3.2, len(activities) * 2.1)),
+        sharex=False,
+        squeeze=False,
+    )
+    for row, activity in enumerate(activities):
+        subset = df[df['activity'].astype(str).eq(str(activity))]
+        if 'source_file' in subset.columns and not subset.empty:
+            subset = subset[subset['source_file'].eq(subset['source_file'].iloc[0])]
+        if 'sample_index' in subset.columns:
+            subset = subset.sort_values('sample_index', kind='stable')
+        subset = subset.head(samples)
+        x, x_label = elapsed_time_axis(subset)
+        for column, axis_name in enumerate(AXES):
+            ax = axs[row, column]
+            if not subset.empty:
+                values = pd.to_numeric(subset[axis_name], errors='coerce').to_numpy(dtype=float)
+                ax.plot(x, values, lw=.75)
+            ax.set_ylabel(f'{activity}\n{axis_name}')
+            ax.grid(alpha=.25)
+            if row == 0:
+                ax.set_title(axis_name)
+            if row == len(activities) - 1:
+                ax.set_xlabel(x_label)
+    fig.suptitle(f'First {samples:,} samples per activity')
     fig.tight_layout()
     return fig
 

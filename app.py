@@ -79,8 +79,8 @@ def timestamp_summary(df):
                      'Missing timestamps': int(np.sum(~np.isfinite(ts))),
                      'Non-increasing differences': int(np.sum(d <= 0)),
                      'Median positive difference': median,
-                     'Large positive differences (>5× median)':
-                     int(np.sum(d > 5 * median)) if np.isfinite(median) and median > 0 else 0})
+                     'Timestamp discontinuities (>1.5× median)':
+                     int(np.sum(d > 1.5 * median)) if np.isfinite(median) and median > 0 else 0})
     return pd.DataFrame(rows)
 
 
@@ -220,28 +220,51 @@ with signals_tab:
         fig, axs = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
         xyz = sub[eda.AXES].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
         magnitude = np.sqrt(np.sum(xyz ** 2, axis=1))
-        x = sub['sample_index'].to_numpy()
+        x, x_label = eda.elapsed_time_axis(sub)
         for idx, axis_name in enumerate(eda.AXES):
             axs[idx].plot(x, xyz[:, idx], lw=.85)
             axs[idx].set_ylabel(axis_name)
             axs[idx].grid(alpha=.3)
         axs[3].plot(x, magnitude, lw=.85)
         axs[3].set_ylabel('Magnitude')
-        axs[3].set_xlabel('Original sample index')
+        axs[3].set_xlabel(x_label if 'timestamp' in sub else 'Original sample index')
         axs[3].grid(alpha=.3)
         fig.suptitle(f'{activity} — {source}')
         fig.tight_layout()
         show_plot(fig, 'raw_signal_xyz_magnitude.png', 'Magnitude = √(X² + Y² + Z²). Used for visualization only.')
         st.dataframe(sub.head(20), hide_index=True, width='stretch')
     st.divider()
-    st.subheader('Compare activities')
+    st.subheader('First samples from every activity (X, Y, Z)')
+    grid_fig, grid_axs = plt.subplots(
+        len(activities), len(eda.AXES),
+        figsize=(13, max(3, 2.2 * len(activities))),
+        squeeze=False, sharex=True,
+    )
+    for row, class_name in enumerate(activities):
+        class_rows = cleaned[cleaned['activity'].astype(str).eq(class_name)]
+        first_source = sorted(class_rows['source_file'].astype(str).unique())[0]
+        first_recording = class_rows[class_rows['source_file'].astype(str).eq(first_source)]
+        first_recording = first_recording.sort_values('sample_index', kind='stable').head(n_samples)
+        values = first_recording[eda.AXES].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+        sample_x = first_recording['sample_index'].to_numpy()
+        for col, axis_name in enumerate(eda.AXES):
+            grid_axs[row, col].plot(sample_x, values[:, col], lw=.85)
+            grid_axs[row, col].grid(alpha=.3)
+            if row == 0:
+                grid_axs[row, col].set_title(axis_name)
+        grid_axs[row, 0].set_ylabel(class_name)
+    grid_axs[-1, 1].set_xlabel('Original sample index')
+    grid_fig.tight_layout()
+    show_plot(grid_fig, 'first_samples_all_activities_xyz.png',
+              'Each row shows one activity and each column one accelerometer axis. The first recording for each class is used; timestamp resets and acquisition gaps are compressed on the elapsed-time axis.')
+    st.subheader('Compare one signal across activities')
     compared = st.multiselect('Choose activities', activities,
-                              default=activities[:min(2, len(activities))], key='signal_compare')
+                              default=activities, key='signal_compare')
     compare_axis = st.selectbox('Signal to compare', [*eda.AXES, 'magnitude'], key='signal_compare_axis')
     if compared:
         show_plot(eda.signal_comparison(cleaned, compared, compare_axis, samples=n_samples),
                   'activity_signal_comparison.png',
-                  'Each activity uses the first available recording; these are descriptive signal comparisons.')
+                  'Shows up to the first 1,000 samples from each selected activity using its first recording. The elapsed timestamp axis compresses resets and large gaps; physical timestamp units are unverified.')
 
 with models_tab:
     st.header('Classical machine learning experiments')
@@ -274,6 +297,9 @@ with models_tab:
         st.dataframe(result['summary'].round(4), hide_index=True, width='stretch')
         st.subheader('Per-run results')
         st.dataframe(result['results'].round(4), hide_index=True, width='stretch')
+        st.subheader('Statistical significance (balanced accuracy)')
+        st.caption('Corrected resampled t-tests compare each model with the 1/number-of-classes chance level and compare models pairwise. Holm-adjusted p-values account for the six comparisons; these remain approximate because repeated windows overlap.')
+        st.dataframe(result['significance_tests'].round(5), hide_index=True, width='stretch')
         st.subheader('Selected hyperparameters')
         st.dataframe(result['best_parameters'], hide_index=True, width='stretch')
         if 'final_model_parameters' in result:
@@ -336,6 +362,7 @@ with downloads_tab:
         st.info('Run experiments to enable ML result downloads. Each chart also has its own PNG download button in its tab.')
     else:
         for key, filename in [('results', 'per_run_results.csv'), ('summary', 'model_summary.csv'),
+                              ('significance_tests', 'significance_tests.csv'),
                               ('best_parameters', 'best_hyperparameters.csv'),
                               ('per_class_metrics', 'per_class_metrics.csv'),
                               ('final_model_parameters', 'final_model_parameters.csv')]:

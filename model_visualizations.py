@@ -10,6 +10,7 @@ METRICS = {
     'recall_weighted': 'Weighted recall',
     'f1_weighted': 'Weighted F1',
     'f1_macro': 'Macro F1',
+    'auc_roc_macro_ovr': 'Macro OvR AUC-ROC',
     'mcc': 'MCC',
 }
 
