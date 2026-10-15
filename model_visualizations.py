@@ -120,6 +120,7 @@ def parameter_frequency(best_parameters):
     if candidate is None:
         ax.text(.5, .5, 'Parameter column unavailable', ha='center', va='center')
     else:
+        df[candidate] = df[candidate].map(str)
         top = df.groupby(['model', candidate]).size().sort_values(ascending=False).head(12)
         ax.barh([f'{m}: {str(p)[:55]}' for m,p in top.index], top.values)
         ax.invert_yaxis()
