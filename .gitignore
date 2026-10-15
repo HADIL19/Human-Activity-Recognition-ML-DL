@@ -11,3 +11,5 @@
 *.pptx
 __pycache__/
 *.pyc
+# Dataset and data folder
+data/
