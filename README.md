@@ -4,10 +4,9 @@ Classical machine learning (KNN, SVM, Decision Tree) for recognising seven activ
 from Shimmer accelerometer recordings, with a Streamlit dashboard, repeated-split
 evaluation, statistical tests and a leakage-aware (segment-grouped) control.
 
-Developed during the CDTA internship *ML Fundamentals & Transfer Learning*
+Developed during the CDTA internship *ML Development & Transfer Learning*
 (Centre de Développement des Technologies Avancées, October 2026).
 
-![Random vs segment-grouped evaluation](figures/fig1_random_vs_grouped.png)
 
 ## Key results
 
@@ -22,7 +21,6 @@ Developed during the CDTA internship *ML Fundamentals & Transfer Learning*
   accuracy by 0.11 to 0.19 and changes the model ranking.
 - On unseen segments, **Sit and Stand are the weak classes** (recall about 0.33 and 0.6 to 0.7).
 
-![Per-class recall](figures/fig2_per_class_recall_grouped.png)
 
 The full analysis is in the project report.
 
@@ -30,7 +28,6 @@ The full analysis is in the project report.
 
 Seven MATLAB files, one per activity (`Fall`, `Jump`, `Lay`, `Run`, `Sit`, `Stand`, `Walk`), each with a
 variable `data` of 11 columns: timestamp, accelerometer X/Y/Z, and seven further channels (not used).
-The `.mat` files are provided by CDTA and are **not** included in this repository; put them in `data/`.
 
 | Activity | Samples | Windows (128) | Segments |
 |---|---|---|---|
@@ -42,13 +39,6 @@ The `.mat` files are provided by CDTA and are **not** included in this repositor
 | Stand | 52,480 | 410 | 16 |
 | Walk | 45,696 | 357 | 13 |
 
-Notes that matter for the evaluation:
-
-- The median timestamp step is 19.53 units, about 51.2 Hz if the unit is milliseconds, so a
-  128-sample window lasts about 2.5 s (the assignment states 2.56 s at 50 Hz). The unit is unconfirmed.
-- Timestamps are not monotonic. Each file is a concatenation of several recording segments; a new
-  segment starts at every timestamp reset (89 segments in total).
-- There are no subject or session identifiers, so segments are the only proxy for independent recordings.
 
 ## Method
 
@@ -84,21 +74,11 @@ Notes that matter for the evaluation:
 ├── requirements.txt
 ├── data/                   # put Fall.mat ... Walk.mat here (git-ignored)
 ├── results/                # CSV outputs of the experiments reported above
-└── figures/                # figures used in this README
 ```
 
-## Dashboard screenshots
 
-| | |
-|---|---|
-| ![Overview](figures/screenshots/ui1_overview.png) | ![Raw signals](figures/screenshots/ui2_compare_activities.png) |
-| Overview tab and sidebar settings | Raw Signals tab (Fall vs Jump) |
-| ![Hyperparameters](figures/screenshots/ui4_hyperparameters.png) | ![MCC per run](figures/screenshots/ui3_run_mcc.png) |
-| ML Experiments tab: selected hyperparameters | Model Comparison tab: MCC per run |
-| ![Confusion matrices](figures/screenshots/ui6_confusion_matrices.png) | ![Downloads](figures/screenshots/ui5_downloads.png) |
-| Model Comparison tab: confusion matrices | Downloads tab |
 
-(Screenshots were taken with a test proportion of 0.20; the results above use 0.25.)
+
 
 ## Installation
 
@@ -154,36 +134,3 @@ raw, _ = load_uploaded_files(sorted(glob.glob("data/*.mat")))
 clean, report = clean_raw_data(raw)
 features = validate_feature_table(extract_window_features(clean))
 ```
-
-A full 10-run evaluation with grid search takes a few minutes on a laptop (about 3 minutes for the
-random protocol and 1.5 minutes for the grouped one in our runs).
-
-## Reproducibility
-
-- Seed 42; run *r* uses seed 42 + *r*.
-- Per-run outputs for both protocols are in `results/` (`*_results.csv`, `*_summary.csv`,
-  `*_per_class_metrics.csv`, `*_pairwise_tests.csv`, `*_best_parameters.csv`).
-- The random protocol reproduces the first figures reported during the internship
-  (KNN accuracy 0.962, MCC 0.955).
-
-## Limitations
-
-- Segments come from timestamp resets, not from verified recording or participant identifiers.
-  The grouped protocol is a control, not proof of generalisation to new subjects.
-- Ten runs give limited resolution for p-values; the permutation test is computed for the random
-  protocol only and uses models tuned on all windows.
-- Timestamp units, the meaning of the extra channels and the sampling frequency are unconfirmed.
-- Fall has only 47 windows, so its recall is uncertain.
-
-## Roadmap
-
-- [ ] Transfer learning: acceleration magnitude to image (CWT scalogram or Gramian angular field),
-      pre-trained VGG/ResNet with frozen early layers and a retrained classifier head, evaluated
-      with the same protocols, metrics and tests.
-- [ ] Richer features (RMS, median, skewness, kurtosis, signal magnitude, frequency-domain energy),
-      mainly to separate Sit from Stand.
-- [ ] 100-run version of the protocol if required for the final report.
-
-## Author
-
-Hadil Khelif, Master 2 Bioinformatics, USTHB. Supervisor: Dr. Oussama Kerdjidj (CDTA).
