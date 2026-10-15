@@ -1,25 +1,11 @@
-# Virtual environment
-.venv/
+# Temporary files
+*.tmp
+~$*
+~WRL*
 
-# Python cache
-__pycache__/
-*.pyc
-
-# Raw datasets
-*.mat
-
-# Extracted features
-features_128.csv
-
-# Documents
-*.pdf
+# Microsoft Office documents
 *.doc
 *.docx
-*.xls
+*.pdf
 *.xlsx
-*.ppt
 *.pptx
-
-# System files
-.DS_Store
-Thumbs.db
