@@ -207,9 +207,17 @@ These p-values are approximate because repeated random splits reuse observations
 
 ## Results
 
-Run the dashboard experiments on the selected dataset and settings to produce current metrics, confidence summaries, and p-values. The earlier fixed score table was removed because correcting window segmentation at timestamp discontinuities changes the feature set, making those scores outdated.
+The results below use the seven supplied MAT recordings, 128-sample windows split at timestamp discontinuities, 10 stratified random splits, a 25% test fraction, and random seed 42. Hyperparameters were tuned inside each training split using five-fold cross-validation.
 
-For the seven supplied MAT recordings, the corrected pipeline produces **1,856 complete windows**: Fall 44, Jump 138, Lay 318, Run 279, Sit 334, Stand 397, and Walk 346. Fall remains the smallest class, so report per-class recall and MCC alongside accuracy.
+| Model | Accuracy | Balanced accuracy | Weighted F1 | Macro F1 | Macro AUC-ROC | MCC | Mean tuning + fit time (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| KNN | 0.9651 ± 0.0088 | 0.9261 ± 0.0195 | 0.9643 ± 0.0090 | 0.9407 ± 0.0162 | 0.9815 ± 0.0096 | 0.9580 ± 0.0106 | 1.38 |
+| Decision Tree | 0.9237 ± 0.0166 | 0.9042 ± 0.0221 | 0.9237 ± 0.0166 | 0.9059 ± 0.0198 | 0.9547 ± 0.0136 | 0.9083 ± 0.0201 | 4.94 |
+| SVM | 0.8828 ± 0.0117 | 0.8910 ± 0.0205 | 0.8809 ± 0.0122 | 0.8929 ± 0.0165 | 0.9854 ± 0.0033 | 0.8595 ± 0.0142 | 6.13 |
+
+Corrected resampled t-tests against the balanced-accuracy chance level of 1/7 were significant for all three models after Holm adjustment (adjusted p-values: KNN 1.27 × 10⁻¹², SVM 2.56 × 10⁻¹², Decision Tree 3.40 × 10⁻¹²). No pairwise model difference remained significant after Holm adjustment; KNN vs SVM was closest (adjusted p = 0.0559). These tests are exploratory because the 10 random splits reuse windows from the same recordings.
+
+The corrected pipeline produces **1,856 complete windows**: Fall 44, Jump 138, Lay 318, Run 279, Sit 334, Stand 397, and Walk 346. Fall is the smallest class, so inspect per-class recall and MCC alongside accuracy.
 
 ## Interactive Streamlit Dashboard
 
