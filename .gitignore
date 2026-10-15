@@ -9,3 +9,5 @@
 *.pdf
 *.xlsx
 *.pptx
+__pycache__/
+*.pyc
