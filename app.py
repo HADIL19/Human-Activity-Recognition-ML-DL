@@ -79,8 +79,8 @@ def timestamp_summary(df):
                      'Missing timestamps': int(np.sum(~np.isfinite(ts))),
                      'Non-increasing differences': int(np.sum(d <= 0)),
                      'Median positive difference': median,
-                     'Timestamp discontinuities (>1.5× median)':
-                     int(np.sum(d > 1.5 * median)) if np.isfinite(median) and median > 0 else 0})
+                     'Large positive differences (>5× median)':
+                     int(np.sum(d > 5 * median)) if np.isfinite(median) and median > 0 else 0})
     return pd.DataFrame(rows)
 
 
@@ -120,6 +120,11 @@ runs = st.sidebar.number_input('Repeated experiments', min_value=10, max_value=1
 test_size = st.sidebar.slider('Test set proportion', 0.10, 0.40, 0.25, 0.05)
 seed = st.sidebar.number_input('Random seed', min_value=0, max_value=999999, value=42)
 folds = st.sidebar.selectbox('Tuning CV folds', [2, 3, 4, 5], index=3)
+protocol = st.sidebar.selectbox('Evaluation protocol',
+    ['Random window split (supervisor protocol)', 'Segment-grouped split (no leakage between segments)'])
+split_mode = 'grouped' if protocol.startswith('Segment') else 'random'
+n_perm = st.sidebar.number_input('Permutation test repetitions (0 = skip)', min_value=0, max_value=1000, value=100, step=50,
+                                 help='Random protocol only. p-value resolution is 1/(repetitions+1).')
 st.sidebar.caption('Repeated grid search can take several minutes.')
 
 st.subheader('Load dataset')
@@ -220,51 +225,28 @@ with signals_tab:
         fig, axs = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
         xyz = sub[eda.AXES].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
         magnitude = np.sqrt(np.sum(xyz ** 2, axis=1))
-        x, x_label = eda.elapsed_time_axis(sub)
+        x = sub['sample_index'].to_numpy()
         for idx, axis_name in enumerate(eda.AXES):
             axs[idx].plot(x, xyz[:, idx], lw=.85)
             axs[idx].set_ylabel(axis_name)
             axs[idx].grid(alpha=.3)
         axs[3].plot(x, magnitude, lw=.85)
         axs[3].set_ylabel('Magnitude')
-        axs[3].set_xlabel(x_label if 'timestamp' in sub else 'Original sample index')
+        axs[3].set_xlabel('Original sample index')
         axs[3].grid(alpha=.3)
         fig.suptitle(f'{activity} — {source}')
         fig.tight_layout()
         show_plot(fig, 'raw_signal_xyz_magnitude.png', 'Magnitude = √(X² + Y² + Z²). Used for visualization only.')
         st.dataframe(sub.head(20), hide_index=True, width='stretch')
     st.divider()
-    st.subheader('First samples from every activity (X, Y, Z)')
-    grid_fig, grid_axs = plt.subplots(
-        len(activities), len(eda.AXES),
-        figsize=(13, max(3, 2.2 * len(activities))),
-        squeeze=False, sharex=True,
-    )
-    for row, class_name in enumerate(activities):
-        class_rows = cleaned[cleaned['activity'].astype(str).eq(class_name)]
-        first_source = sorted(class_rows['source_file'].astype(str).unique())[0]
-        first_recording = class_rows[class_rows['source_file'].astype(str).eq(first_source)]
-        first_recording = first_recording.sort_values('sample_index', kind='stable').head(n_samples)
-        values = first_recording[eda.AXES].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
-        sample_x = first_recording['sample_index'].to_numpy()
-        for col, axis_name in enumerate(eda.AXES):
-            grid_axs[row, col].plot(sample_x, values[:, col], lw=.85)
-            grid_axs[row, col].grid(alpha=.3)
-            if row == 0:
-                grid_axs[row, col].set_title(axis_name)
-        grid_axs[row, 0].set_ylabel(class_name)
-    grid_axs[-1, 1].set_xlabel('Original sample index')
-    grid_fig.tight_layout()
-    show_plot(grid_fig, 'first_samples_all_activities_xyz.png',
-              'Each row shows one activity and each column one accelerometer axis. The first recording for each class is used; timestamp resets and acquisition gaps are compressed on the elapsed-time axis.')
-    st.subheader('Compare one signal across activities')
+    st.subheader('Compare activities')
     compared = st.multiselect('Choose activities', activities,
-                              default=activities, key='signal_compare')
+                              default=activities[:min(2, len(activities))], key='signal_compare')
     compare_axis = st.selectbox('Signal to compare', [*eda.AXES, 'magnitude'], key='signal_compare_axis')
     if compared:
         show_plot(eda.signal_comparison(cleaned, compared, compare_axis, samples=n_samples),
                   'activity_signal_comparison.png',
-                  'Shows up to the first 1,000 samples from each selected activity using its first recording. The elapsed timestamp axis compresses resets and large gaps; physical timestamp units are unverified.')
+                  'Each activity uses the first available recording; these are descriptive signal comparisons.')
 
 with models_tab:
     st.header('Classical machine learning experiments')
@@ -273,8 +255,11 @@ with models_tab:
     c1.metric('Runs', int(runs))
     c2.metric('Test proportion', f'{test_size:.0%}')
     c3.metric('CV folds', int(folds))
-    st.warning('Window-level splits may mix related windows from the same recording across train and test, potentially inflating performance.')
-    signature = (len(features), tuple(features.columns), int(runs), float(test_size), int(seed), int(folds))
+    if split_mode == 'random':
+        st.warning('Window-level splits may mix related windows from the same recording across train and test, potentially inflating performance.')
+    else:
+        st.info('Segment-grouped protocol: windows from the same timestamp-delimited segment stay together in train or test.')
+    signature = (len(features), tuple(features.columns), int(runs), float(test_size), int(seed), int(folds), split_mode, int(n_perm))
     if st.session_state['experiment_output'] is not None and st.session_state['experiment_signature'] != signature:
         st.warning('Settings changed. Previous results are displayed until you run experiments again.')
     if st.button('Run model experiments', type='primary', width='stretch'):
@@ -283,7 +268,8 @@ with models_tab:
             with st.spinner('Running nested tuning and repeated evaluations...'):
                 result = repeated_random_split_experiments(feature_df=features,
                     n_runs=int(runs), test_size=float(test_size),
-                    random_state=int(seed), inner_cv_splits=int(folds))
+                    random_state=int(seed), inner_cv_splits=int(folds),
+                    split_mode=split_mode, n_permutations=int(n_perm))
             st.session_state['experiment_output'] = result
             st.session_state['experiment_signature'] = signature
             st.success(f'Experiments completed in {time.perf_counter()-start:.1f} seconds.')
@@ -297,14 +283,19 @@ with models_tab:
         st.dataframe(result['summary'].round(4), hide_index=True, width='stretch')
         st.subheader('Per-run results')
         st.dataframe(result['results'].round(4), hide_index=True, width='stretch')
-        st.subheader('Statistical significance (balanced accuracy)')
-        st.caption('Corrected resampled t-tests compare each model with the 1/number-of-classes chance level and compare models pairwise. Holm-adjusted p-values account for the six comparisons; these remain approximate because repeated windows overlap.')
-        st.dataframe(result['significance_tests'].round(5), hide_index=True, width='stretch')
         st.subheader('Selected hyperparameters')
         st.dataframe(result['best_parameters'], hide_index=True, width='stretch')
         if 'final_model_parameters' in result:
             with st.expander('Final model parameters (trained on all windows)'):
                 st.dataframe(result['final_model_parameters'], hide_index=True, width='stretch')
+        st.subheader('Statistical tests')
+        if result.get('chance_test') is not None:
+            st.markdown('**Against chance** - permutation test (balanced accuracy, 5-fold, labels shuffled)')
+            st.dataframe(result['chance_test'].round(4), hide_index=True, width='stretch')
+        st.markdown('**Between models** - paired tests over the repeated runs (balanced accuracy)')
+        st.dataframe(result['pairwise_tests'].round(4), hide_index=True, width='stretch')
+        if result.get('friedman_test'):
+            st.caption(f"Friedman test over all models: p = {result['friedman_test']['p_value']:.4g}")
         st.info(result.get('evaluation_note', 'Repeated splits are not independent held-out recordings.'))
         st.caption('See the Model Comparison tab for all interactive performance charts.')
 
@@ -362,9 +353,9 @@ with downloads_tab:
         st.info('Run experiments to enable ML result downloads. Each chart also has its own PNG download button in its tab.')
     else:
         for key, filename in [('results', 'per_run_results.csv'), ('summary', 'model_summary.csv'),
-                              ('significance_tests', 'significance_tests.csv'),
                               ('best_parameters', 'best_hyperparameters.csv'),
                               ('per_class_metrics', 'per_class_metrics.csv'),
+                              ('pairwise_tests', 'pairwise_tests.csv'), ('chance_test', 'chance_test.csv'),
                               ('final_model_parameters', 'final_model_parameters.csv')]:
             if key in result and isinstance(result[key], pd.DataFrame):
                 st.download_button(f'{key.replace("_", " ").title()} (CSV)', csv_bytes(result[key]),

@@ -10,8 +10,8 @@ METRICS = {
     'recall_weighted': 'Weighted recall',
     'f1_weighted': 'Weighted F1',
     'f1_macro': 'Macro F1',
-    'auc_roc_macro_ovr': 'Macro OvR AUC-ROC',
     'mcc': 'MCC',
+    'roc_auc_ovr': 'ROC-AUC (OvR)',
 }
 
 
@@ -121,7 +121,6 @@ def parameter_frequency(best_parameters):
     if candidate is None:
         ax.text(.5, .5, 'Parameter column unavailable', ha='center', va='center')
     else:
-        df[candidate] = df[candidate].map(str)
         top = df.groupby(['model', candidate]).size().sort_values(ascending=False).head(12)
         ax.barh([f'{m}: {str(p)[:55]}' for m,p in top.index], top.values)
         ax.invert_yaxis()

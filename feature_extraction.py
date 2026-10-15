@@ -20,7 +20,6 @@ import pandas as pd
 
 
 DEFAULT_WINDOW_SIZE = 128
-TIMESTAMP_GAP_FACTOR = 1.5
 
 AXES = {
     "x": "accel_x",
@@ -44,6 +43,8 @@ METADATA_COLUMNS = [
     "window_start_sample",
     "window_end_sample",
     "window_size",
+    "group_id",
+    "crosses_break",
 ]
 
 
@@ -124,24 +125,6 @@ def _has_consecutive_indices(group):
         return True
 
     return bool(np.all(np.diff(indices) == 1))
-
-
-def _continuous_run_slices(group):
-    """Split rows at missing indices and timestamp discontinuities."""
-    indices = pd.to_numeric(group["sample_index"], errors="coerce").to_numpy(dtype=float)
-    breaks = set((np.flatnonzero(np.diff(indices) != 1) + 1).tolist())
-
-    if "timestamp" in group.columns:
-        timestamps = pd.to_numeric(group["timestamp"], errors="coerce").to_numpy(dtype=float)
-        deltas = np.diff(timestamps)
-        positive = deltas[np.isfinite(deltas) & (deltas > 0)]
-        time_break_mask = ~np.isfinite(deltas) | (deltas <= 0)
-        if len(positive):
-            median_delta = float(np.median(positive))
-            time_break_mask |= deltas > TIMESTAMP_GAP_FACTOR * median_delta
-        breaks.update((np.flatnonzero(time_break_mask) + 1).tolist())
-
-    return np.split(np.arange(len(group)), sorted(breaks))
 
 
 def extract_window_features(
@@ -246,10 +229,28 @@ def extract_window_features(
         group = group.sort_values(
             "sample_index",
             kind="stable",
-        )
+        ).copy()
 
-        # Do not bridge missing indices or timestamps that reset/jump.
-        runs = _continuous_run_slices(group)
+        # Recording-segment counter: a timestamp that does not increase
+        # (reset) starts a new recording segment. Used only to build
+        # group_id for group-aware evaluation; windowing is unchanged.
+        if "timestamp" in group.columns:
+            ts = pd.to_numeric(
+                group["timestamp"], errors="coerce"
+            ).to_numpy(dtype=float)
+            step = np.diff(ts)
+            resets = np.where(np.isnan(step), False, step <= 0)
+            group["_segment"] = np.concatenate(
+                [[0], np.cumsum(resets)]
+            ).astype(int)
+        else:
+            group["_segment"] = 0
+
+        # Do not bridge missing indices. Split into uninterrupted runs.
+        indices = group["sample_index"].to_numpy(dtype=float)
+        breaks = np.flatnonzero(np.diff(indices) != 1) + 1
+
+        runs = np.split(np.arange(len(group)), breaks)
 
         for run_indices in runs:
             run = group.iloc[run_indices]
@@ -290,6 +291,15 @@ def extract_window_features(
                     "window_start_sample": start_sample,
                     "window_end_sample": end_sample,
                     "window_size": window_size,
+                    # Windows of the same recording segment share a group_id
+                    # so they can be kept together in train OR test.
+                    "group_id": (
+                        f"{source_file}#"
+                        f"{int(window['_segment'].iloc[0])}"
+                    ),
+                    "crosses_break": bool(
+                        window["_segment"].nunique() > 1
+                    ),
                 }
 
                 row.update(features)

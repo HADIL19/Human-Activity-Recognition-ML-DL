@@ -367,7 +367,7 @@ def clean_raw_data(df):
 
                 if median_delta > 0:
                     large_timestamp_gaps += int(
-                        np.sum(deltas > 1.5 * median_delta)
+                        np.sum(deltas > 5 * median_delta)
                     )
 
     ordered = cleaned.sort_values(

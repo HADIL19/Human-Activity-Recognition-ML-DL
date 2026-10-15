@@ -33,7 +33,6 @@ from sklearn.base import clone
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
-    roc_auc_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
@@ -47,13 +46,15 @@ from sklearn.model_selection import (
     ParameterGrid,
     StratifiedShuffleSplit,
     StratifiedKFold,
+    StratifiedGroupKFold,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from stat_tests import compare_models, chance_level_test
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
-from scipy.stats import t as student_t
 
 
 # Must match feature_extraction.py.
@@ -79,16 +80,17 @@ METRIC_COLUMNS = [
     "recall_weighted",
     "f1_weighted",
     "f1_macro",
-    "auc_roc_macro_ovr",
     "mcc",
+    "roc_auc_ovr",
 ]
 
-# Keep nested grid searches responsive on desktop Streamlit runs.
-GRID_SEARCH_N_JOBS = 2
 
+def prepare_dataset(feature_df, return_groups=False):
+    """Validate features and encode activity labels.
 
-def prepare_dataset(feature_df):
-    """Validate features and encode activity labels."""
+    With return_groups=True a 4th value is returned: the group_id of each
+    window (recording segment), or None if the column is missing.
+    """
 
     if not isinstance(feature_df, pd.DataFrame):
         raise TypeError("feature_df must be a pandas DataFrame.")
@@ -141,6 +143,14 @@ def prepare_dataset(feature_df):
     label_encoder = LabelEncoder()
     y = label_encoder.fit_transform(y_text)
 
+    if return_groups:
+        groups = (
+            df["group_id"].astype(str).to_numpy()
+            if "group_id" in df.columns
+            else None
+        )
+        return X, y, label_encoder, groups
+
     return X, y, label_encoder
 
 
@@ -163,7 +173,6 @@ def build_models(random_state=42):
                     "classifier",
                     SVC(
                         class_weight="balanced",
-                        probability=True,
                         random_state=random_state,
                     ),
                 ),
@@ -213,10 +222,35 @@ def build_parameter_grids():
     }
 
 
-def calculate_metrics(y_true, y_pred, y_score=None):
-    """Calculate classification metrics."""
+def _class_scores(model, X):
+    """Probabilities if available, otherwise decision scores (SVM)."""
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)
+    return model.decision_function(X)
 
-    metrics = {
+
+def calculate_auc_ovr(y_true, scores, n_classes):
+    """Macro one-vs-rest ROC-AUC (classes without both labels are skipped)."""
+    classes = np.arange(n_classes)
+    y_bin = label_binarize(y_true, classes=classes)
+    values = []
+    for k in classes:
+        if 0 < y_bin[:, k].sum() < len(y_bin):
+            values.append(roc_auc_score(y_bin[:, k], scores[:, k]))
+    return float(np.mean(values)) if values else float("nan")
+
+
+def calculate_metrics(y_true, y_pred, y_score=None, n_classes=None):
+    """Calculate classification metrics (ROC-AUC if scores are given)."""
+
+    auc = (
+        calculate_auc_ovr(y_true, y_score, n_classes)
+        if y_score is not None
+        else float("nan")
+    )
+
+    return {
+        "roc_auc_ovr": auc,
         "accuracy": accuracy_score(y_true, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "precision_weighted": precision_score(
@@ -245,124 +279,37 @@ def calculate_metrics(y_true, y_pred, y_score=None):
         ),
         "mcc": matthews_corrcoef(y_true, y_pred),
     }
-    if y_score is not None:
-        if len(np.unique(y_true)) == 2:
-            metrics["auc_roc_macro_ovr"] = roc_auc_score(y_true, y_score[:, 1])
-        else:
-            metrics["auc_roc_macro_ovr"] = roc_auc_score(
-                y_true,
-                y_score,
-                labels=np.arange(y_score.shape[1]),
-                multi_class="ovr",
-                average="macro",
-            )
-    return metrics
 
 
-def _corrected_resampled_t_test(differences, test_train_ratio, alternative):
-    """Return a Nadeau-Bengio corrected repeated-holdout t statistic."""
-    differences = np.asarray(differences, dtype=float)
-    n = len(differences)
-    if n < 2:
-        raise ValueError("At least two repeated splits are required for inference.")
+def _make_cv(y, random_state, max_splits=5, groups=None):
+    """Create feasible stratified cross-validation folds.
 
-    mean_difference = float(np.mean(differences))
-    sample_variance = float(np.var(differences, ddof=1))
-    standard_error = float(np.sqrt((1 / n + test_train_ratio) * sample_variance))
-    degrees_of_freedom = n - 1
-
-    if standard_error == 0:
-        statistic = 0.0 if mean_difference == 0 else float(np.sign(mean_difference) * np.inf)
-        if mean_difference == 0:
-            p_value = 1.0
-        elif alternative == "greater":
-            p_value = 0.0 if mean_difference > 0 else 1.0
-        else:
-            p_value = 0.0
-    else:
-        statistic = mean_difference / standard_error
-        if alternative == "greater":
-            p_value = float(student_t.sf(statistic, degrees_of_freedom))
-        else:
-            p_value = float(2 * student_t.sf(abs(statistic), degrees_of_freedom))
-
-    critical_value = float(student_t.ppf(0.975, degrees_of_freedom))
-    return statistic, standard_error, p_value, critical_value, degrees_of_freedom
-
-
-def _holm_adjust(p_values):
-    """Holm-Bonferroni adjustment, preserving the input order."""
-    p_values = np.asarray(p_values, dtype=float)
-    order = np.argsort(p_values)
-    adjusted = np.empty(len(p_values), dtype=float)
-    running_max = 0.0
-    for rank, index in enumerate(order):
-        running_max = max(running_max, (len(p_values) - rank) * p_values[index])
-        adjusted[index] = min(1.0, running_max)
-    return adjusted
-
-
-def _significance_tests(results_df, n_classes, test_size):
-    """Test balanced accuracy against chance and between models."""
-    metric = "balanced_accuracy"
-    test_train_ratio = test_size / (1 - test_size)
-    records = []
-
-    for model, group in results_df.groupby("model", sort=False):
-        scores = group[metric].to_numpy(dtype=float)
-        chance = 1.0 / n_classes
-        differences = scores - chance
-        statistic, standard_error, p_value, critical, df = (
-            _corrected_resampled_t_test(differences, test_train_ratio, "greater")
-        )
-        records.append({
-            "comparison": f"{model} vs chance ({chance:.4f})",
-            "test": "One-sided corrected resampled t-test",
-            "metric": metric,
-            "mean_difference": float(np.mean(differences)),
-            "corrected_standard_error": standard_error,
-            "t_statistic": statistic,
-            "degrees_of_freedom": df,
-            "p_value": p_value,
-            "ci_95_lower": float(np.mean(differences) - critical * standard_error),
-            "ci_95_upper": float(np.mean(differences) + critical * standard_error),
-        })
-
-    models = list(results_df["model"].drop_duplicates())
-    for left_index, model_a in enumerate(models):
-        scores_a = results_df.loc[results_df["model"] == model_a].sort_values("run")[metric].to_numpy(dtype=float)
-        for model_b in models[left_index + 1:]:
-            scores_b = results_df.loc[results_df["model"] == model_b].sort_values("run")[metric].to_numpy(dtype=float)
-            differences = scores_a - scores_b
-            statistic, standard_error, p_value, critical, df = (
-                _corrected_resampled_t_test(differences, test_train_ratio, "two-sided")
-            )
-            records.append({
-                "comparison": f"{model_a} vs {model_b}",
-                "test": "Two-sided corrected resampled t-test",
-                "metric": metric,
-                "mean_difference": float(np.mean(differences)),
-                "corrected_standard_error": standard_error,
-                "t_statistic": statistic,
-                "degrees_of_freedom": df,
-                "p_value": p_value,
-                "ci_95_lower": float(np.mean(differences) - critical * standard_error),
-                "ci_95_upper": float(np.mean(differences) + critical * standard_error),
-            })
-
-    table = pd.DataFrame(records)
-    table["p_value_holm"] = _holm_adjust(table["p_value"].to_numpy())
-    table["significant_at_0_05"] = table["p_value_holm"] < 0.05
-    return table
-
-
-def _make_cv(y, random_state, max_splits=5):
-    """Create feasible stratified cross-validation folds."""
+    With groups, folds never split a recording segment (group-aware).
+    """
 
     _, counts = np.unique(y, return_counts=True)
 
     if len(counts) < 2:
         raise ValueError("At least two classes are required.")
+
+    if groups is not None:
+        groups = np.asarray(groups)
+        per_class_groups = [
+            len(np.unique(groups[y == c])) for c in np.unique(y)
+        ]
+        n_splits = min(int(max_splits), int(min(per_class_groups)))
+
+        if n_splits < 2:
+            raise ValueError(
+                "Group-aware CV needs at least two segments per class "
+                "in the training data."
+            )
+
+        return StratifiedGroupKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=random_state,
+        )
 
     n_splits = min(int(max_splits), int(counts.min()))
 
@@ -434,6 +381,7 @@ def _tune_and_fit(
     y_train,
     random_state,
     inner_cv_splits=5,
+    groups_train=None,
 ):
     """Tune and fit a model using training data only."""
 
@@ -441,6 +389,7 @@ def _tune_and_fit(
         y_train,
         random_state=random_state,
         max_splits=inner_cv_splits,
+        groups=groups_train,
     )
 
     safe_grid = _valid_parameter_candidates(
@@ -455,7 +404,7 @@ def _tune_and_fit(
         param_grid=safe_grid,
         scoring="balanced_accuracy",
         cv=cv,
-        n_jobs=GRID_SEARCH_N_JOBS,
+        n_jobs=-1,
         refit=True,
         error_score="raise",
     )
@@ -464,7 +413,7 @@ def _tune_and_fit(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        search.fit(X_train, y_train)
+        search.fit(X_train, y_train, groups=groups_train)
 
     fit_seconds = time.perf_counter() - start_time
 
@@ -519,6 +468,7 @@ def _fit_final_models(
     parameter_grids,
     random_state,
     inner_cv_splits,
+    groups=None,
 ):
     """Tune and fit deployable models using all available windows."""
 
@@ -530,6 +480,7 @@ def _fit_final_models(
             y,
             random_state=random_state,
             max_splits=inner_cv_splits,
+            groups=groups,
         )
 
         safe_grid = _valid_parameter_candidates(
@@ -544,14 +495,14 @@ def _fit_final_models(
             param_grid=safe_grid,
             scoring="balanced_accuracy",
             cv=full_cv,
-            n_jobs=GRID_SEARCH_N_JOBS,
+            n_jobs=-1,
             refit=True,
             error_score="raise",
         )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            search.fit(X, y)
+            search.fit(X, y, groups=groups)
 
         final_models[model_name] = search.best_estimator_
 
@@ -566,6 +517,64 @@ def _fit_final_models(
     return final_models, pd.DataFrame(final_model_parameters)
 
 
+def _outer_splits(y, groups, n_runs, test_size, random_state, split_mode):
+    """Yield (train_idx, test_idx) for every run.
+
+    random  : stratified random split of windows (supervisor protocol).
+    grouped : random split of recording SEGMENTS (per class) - all windows
+              of a segment go to train or to test, never both.
+    """
+    if split_mode == "random":
+        splitter = StratifiedShuffleSplit(
+            n_splits=int(n_runs),
+            test_size=test_size,
+            random_state=random_state,
+        )
+        yield from splitter.split(np.zeros(len(y)), y)
+        return
+
+    if split_mode != "grouped":
+        raise ValueError("split_mode must be 'random' or 'grouped'.")
+
+    if groups is None:
+        raise ValueError(
+            "Grouped evaluation needs a group_id column. "
+            "Re-extract features with the updated feature_extraction.py."
+        )
+
+    classes = np.unique(y)
+
+    for run in range(int(n_runs)):
+        rng = np.random.RandomState(random_state + run)
+        test_mask = np.zeros(len(y), dtype=bool)
+
+        # For every class, randomly pick whole segments for the test set
+        # until about test_size of that class's windows is reached.
+        for c in classes:
+            class_groups = np.unique(groups[y == c])
+
+            if len(class_groups) < 2:
+                raise ValueError(
+                    "Each class needs at least two recording segments "
+                    "for grouped evaluation."
+                )
+
+            rng.shuffle(class_groups)
+            target = test_size * np.sum(y == c)
+            taken = 0
+            chosen_groups = []
+
+            for grp in class_groups[:-1]:  # keep >= 1 segment in train
+                if taken >= target and chosen_groups:
+                    break
+                chosen_groups.append(grp)
+                taken += np.sum((groups == grp) & (y == c))
+
+            test_mask |= np.isin(groups, chosen_groups) & (y == c)
+
+        yield np.flatnonzero(~test_mask), np.flatnonzero(test_mask)
+
+
 def repeated_random_split_experiments(
     feature_df,
     n_runs=10,
@@ -573,6 +582,8 @@ def repeated_random_split_experiments(
     random_state=42,
     knn_neighbors=5,
     inner_cv_splits=5,
+    split_mode="random",
+    n_permutations=100,
 ):
     """
     Compare KNN, SVM, and Decision Tree across repeated stratified splits.
@@ -596,7 +607,15 @@ def repeated_random_split_experiments(
     if inner_cv_splits < 2:
         raise ValueError("inner_cv_splits must be at least 2.")
 
-    X, y, label_encoder = prepare_dataset(feature_df)
+    X, y, label_encoder, groups = prepare_dataset(
+        feature_df, return_groups=True
+    )
+
+    if split_mode == "grouped" and groups is None:
+        raise ValueError(
+            "Grouped evaluation needs a group_id column. "
+            "Re-extract features with the updated feature_extraction.py."
+        )
 
     n_classes = len(label_encoder.classes_)
 
@@ -613,10 +632,8 @@ def repeated_random_split_experiments(
     models = build_models(random_state=random_state)
     parameter_grids = build_parameter_grids()
 
-    outer_cv = StratifiedShuffleSplit(
-        n_splits=int(n_runs),
-        test_size=test_size,
-        random_state=random_state,
+    outer_splits = _outer_splits(
+        y, groups, n_runs, test_size, random_state, split_mode
     )
 
     results = []
@@ -629,7 +646,7 @@ def repeated_random_split_experiments(
     }
 
     for run_number, (train_indices, test_indices) in enumerate(
-        outer_cv.split(X, y),
+        outer_splits,
         start=1,
     ):
         X_train = X.iloc[train_indices]
@@ -637,6 +654,11 @@ def repeated_random_split_experiments(
 
         y_train = y[train_indices]
         y_test = y[test_indices]
+        groups_train = (
+            groups[train_indices]
+            if (split_mode == "grouped" and groups is not None)
+            else None
+        )
 
         for model_name, model in models.items():
             try:
@@ -653,21 +675,28 @@ def repeated_random_split_experiments(
                     y_train=y_train,
                     random_state=random_state + run_number,
                     inner_cv_splits=inner_cv_splits,
+                    groups_train=groups_train,
                 )
 
                 prediction_start = time.perf_counter()
                 y_pred = fitted_model.predict(X_test)
-                y_score = fitted_model.predict_proba(X_test)
                 prediction_seconds = (
                     time.perf_counter() - prediction_start
                 )
 
-                metrics = calculate_metrics(y_test, y_pred, y_score=y_score)
+                metrics = calculate_metrics(
+                    y_test,
+                    y_pred,
+                    y_score=_class_scores(fitted_model, X_test),
+                    n_classes=n_classes,
+                )
 
                 results.append(
                     {
                         "run": run_number,
                         "model": model_name,
+                        "n_train": int(len(train_indices)),
+                        "n_test": int(len(test_indices)),
                         **metrics,
                         "best_cv_balanced_accuracy": best_cv_score,
                         "tuning_and_fit_seconds": fit_seconds,
@@ -736,11 +765,6 @@ def repeated_random_split_experiments(
         "balanced_accuracy_mean",
         ascending=False,
     ).reset_index(drop=True)
-    significance_tests_df = _significance_tests(
-        results_df=results_df,
-        n_classes=n_classes,
-        test_size=test_size,
-    )
 
     per_class_df = pd.DataFrame(per_class_reports)
     best_parameters_df = pd.DataFrame(best_parameters)
@@ -753,22 +777,44 @@ def repeated_random_split_experiments(
             parameter_grids=parameter_grids,
             random_state=random_state,
             inner_cv_splits=inner_cv_splits,
+            groups=groups if split_mode == "grouped" else None,
         )
     except Exception as exc:
         raise RuntimeError(
             f"Final model fitting failed: {exc}"
         ) from exc
 
+    # ---- p-values -------------------------------------------------
+    pairwise_tests, friedman_test = compare_models(
+        results_df, metric="balanced_accuracy"
+    )
+
+    chance_test = None
+    if split_mode == "random" and n_permutations and n_permutations > 0:
+        chance_test = chance_level_test(
+            final_models,
+            X,
+            y,
+            n_permutations=int(n_permutations),
+            random_state=random_state,
+        )
+
     return {
         "results": results_df,
         "summary": summary_df,
-        "significance_tests": significance_tests_df,
         "confusion_matrices": confusion_matrices,
         "per_class_metrics": per_class_df,
         "best_parameters": best_parameters_df,
         "final_model_parameters": final_model_parameters_df,
         "label_encoder": label_encoder,
         "final_models": final_models,
+        "split_mode": split_mode,
+        "pairwise_tests": pairwise_tests,
+        "friedman_test": friedman_test,
+        "chance_test": chance_test,
+        "n_segments": (
+            int(len(np.unique(groups))) if groups is not None else None
+        ),
         "feature_columns": FEATURE_COLUMNS,
         "n_runs": int(n_runs),
         "test_size": test_size,
@@ -779,12 +825,15 @@ def repeated_random_split_experiments(
             "A window may appear in multiple test splits."
         ),
         "evaluation_note": (
-            "Repeated stratified holdout results are useful for "
-            "comparing models, but runs overlap and are not "
-            "statistically independent. P-values use a corrected "
-            "resampled t-test and Holm adjustment, but remain "
-            "approximate with only 10 splits and window-level leakage. "
-            "If independent recording or participant identifiers "
-            "become available, use group-aware evaluation."
+            "Segment-grouped evaluation: all windows of a recording "
+            "segment are in train OR test. Segments come from timestamp "
+            "resets, not from verified recording/participant IDs. "
+            "Runs still overlap, so p-values are approximate."
+            if split_mode == "grouped"
+            else "Random window-level splits: related windows from the "
+            "same recording can fall in both train and test, which "
+            "inflates scores (compare with the segment-grouped "
+            "protocol). Runs overlap and are not statistically "
+            "independent, so p-values are approximate."
         ),
     }
