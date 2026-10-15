@@ -1,5 +1,25 @@
+# Virtual environment
 .venv/
+venv/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Dataset files
 data/*.mat
+
+# Documents
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.txt
+*.rtf
+
+# Operating system files
 .DS_Store
+Thumbs.db
