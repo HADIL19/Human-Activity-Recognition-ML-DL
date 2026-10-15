@@ -1,13 +1,15 @@
 # Virtual environment
 .venv/
-venv/
 
 # Python cache
 __pycache__/
 *.pyc
 
-# Dataset files
-data/*.mat
+# Raw datasets
+*.mat
+
+# Extracted features
+features_128.csv
 
 # Documents
 *.pdf
@@ -17,9 +19,7 @@ data/*.mat
 *.xlsx
 *.ppt
 *.pptx
-*.txt
-*.rtf
 
-# Operating system files
+# System files
 .DS_Store
 Thumbs.db
