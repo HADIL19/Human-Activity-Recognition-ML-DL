@@ -15,6 +15,7 @@ from feature_extraction import extract_window_features, validate_feature_table
 from ml_experiments import repeated_random_split_experiments
 import eda_visualizations as eda
 import model_visualizations as mv
+from model_io import export_bundle, import_bundle, features_from_csv, features_from_mat, predict_features
 
 st.set_page_config(page_title='CDTA Shimmer ML', page_icon='📊', layout='wide')
 st.title('CDTA Shimmer Activity Recognition')
@@ -126,6 +127,41 @@ split_mode = 'grouped' if protocol.startswith('Segment') else 'random'
 n_perm = st.sidebar.number_input('Permutation test repetitions (0 = skip)', min_value=0, max_value=1000, value=100, step=50,
                                  help='Random protocol only. p-value resolution is 1/(repetitions+1).')
 st.sidebar.caption('Repeated grid search can take several minutes.')
+
+# Inference is independent of the training dataset: load a previously exported bundle.
+st.subheader('Predict activities with a saved model')
+with st.expander('Upload a saved model bundle and new Shimmer data', expanded=False):
+    st.caption('Only load model ZIPs that you created or fully trust (Joblib can execute code).')
+    bundle_upload = st.file_uploader('Trained model bundle (.zip)', type=['zip'], key='prediction_bundle')
+    inference_upload = st.file_uploader('New data: baseline feature CSV or Shimmer MAT',
+                                       type=['csv', 'mat'], key='prediction_data')
+    if bundle_upload is not None and inference_upload is not None:
+        st.warning('MAT inference assumes one continuous recording with timestamp in column 1 '
+                   'and accelerometer X/Y/Z in columns 2–4. Check recording boundaries and channel '
+                   'mapping before relying on predictions. The file name is not used as a label.')
+        if st.button('Predict activities', key='predict_saved_model'):
+            try:
+                meta, saved_models, saved_encoder = import_bundle(bundle_upload.getvalue())
+                model_choice = st.session_state.get('prediction_model_choice', 'svm')
+                if model_choice not in saved_models:
+                    model_choice = next(iter(saved_models))
+                new_features = (features_from_mat(inference_upload)
+                                if inference_upload.name.lower().endswith('.mat')
+                                else features_from_csv(inference_upload))
+                predicted = predict_features(saved_models[model_choice], saved_encoder, new_features)
+                st.session_state['prediction_results'] = predicted
+                st.success(f'Predicted {len(predicted)} windows with {model_choice.upper()} '
+                           f'(trained using {meta["split_mode"]} protocol).')
+            except Exception as exc:
+                show_error(exc)
+        st.selectbox('Model for prediction', ['svm', 'knn', 'decision_tree'],
+                     key='prediction_model_choice')
+    if st.session_state.get('prediction_results') is not None:
+        predictions = st.session_state['prediction_results']
+        st.dataframe(predictions, hide_index=True)
+        st.download_button('Download predictions (CSV)', csv_bytes(predictions),
+                           'shimmer_predictions.csv', 'text/csv')
+
 
 st.subheader('Load dataset')
 load_col, reset_col = st.columns([3, 1])
@@ -352,6 +388,13 @@ with downloads_tab:
     if result is None:
         st.info('Run experiments to enable ML result downloads. Each chart also has its own PNG download button in its tab.')
     else:
+        st.subheader('Save fitted models for later prediction')
+        st.caption('Exports KNN, SVM, Decision Tree, label encoder and feature metadata. '
+                   'These final models were refitted on all supplied windows; do not treat '
+                   'their training performance as an independent test score.')
+        st.download_button('⬇ Download trained models (ZIP)', export_bundle(result),
+                           file_name=f'shimmer_models_{result["split_mode"]}.zip',
+                           mime='application/zip', key='download_model_bundle')
         for key, filename in [('results', 'per_run_results.csv'), ('summary', 'model_summary.csv'),
                               ('best_parameters', 'best_hyperparameters.csv'),
                               ('per_class_metrics', 'per_class_metrics.csv'),
