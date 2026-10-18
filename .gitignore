@@ -13,3 +13,5 @@ __pycache__/
 *.pyc
 # Dataset and data folder
 data/
+# Trained ML models
+models/
