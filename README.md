@@ -1,39 +1,29 @@
 # Human Activity Recognition on Shimmer Accelerometer Data
 
-Classical machine learning (KNN, SVM, Decision Tree) for recognising seven activities
-from Shimmer accelerometer recordings, with a Streamlit dashboard, repeated-split
-evaluation, statistical tests and a leakage-aware (segment-grouped) control.
+Classical machine learning for recognizing seven human activities from Shimmer accelerometer recordings. This project compares K-Nearest Neighbors (KNN), Support Vector Machines (SVM), and Decision Trees using repeated evaluations, statistical tests, and a segment-grouped control for potential data leakage. A Streamlit dashboard supports exploration, training, saved-model management, and inference without retraining.
 
-Developed during the CDTA internship *ML Fundamentals & Transfer Learning*
-(Centre de Développement des Technologies Avancées, October 2026).
+## Key Results
 
-![Random vs segment-grouped evaluation](figures/fig1_random_vs_grouped.png)
+Mean scores over 10 runs:
 
-## Key results
+| Evaluation protocol | Highest-accuracy model | Accuracy | Balanced accuracy | MCC |
+|---|---|---:|---:|---:|
+| A — Random window split | KNN | 0.962 | 0.930 | 0.955 |
+| B — Segment-grouped split | SVM | 0.779 | 0.780 | 0.742 |
 
-| Protocol | Best model | Accuracy | Balanced accuracy | MCC |
-|---|---|---|---|---|
-| A. Random window split (10 runs) | KNN | 0.962 | 0.930 | 0.955 |
-| B. Segment-grouped split (10 runs) | SVM | 0.779 | 0.780 | 0.742 |
-
-- All models are far above chance (permutation test, 100 permutations, p = 0.0099, the minimum possible).
-- A random split of windows **overestimates** performance: neighbouring windows from the same
-  recording segment end up in both train and test. Holding out whole segments lowers balanced
-  accuracy by 0.11 to 0.19 and changes the model ranking.
-- On unseen segments, **Sit and Stand are the weak classes** (recall about 0.33 and 0.6 to 0.7).
-
-![Per-class recall](figures/fig2_per_class_recall_grouped.png)
-
-The full analysis is in the project report.
+- All three algorithms scored above chance under protocol A (100-permutation test; p = 0.0099).
+- Random window splits can overestimate performance when neighboring windows from the same recording segment occur in both training and test sets.
+- Grouped evaluation lowers balanced accuracy and changes the model ranking. Pairwise differences do not survive the corrected t-test under protocol B.
+- The grouped protocol is a more conservative estimate for unseen recording segments, **not** a verified subject-independent evaluation.
 
 ## Dataset
 
-Seven MATLAB files, one per activity (`Fall`, `Jump`, `Lay`, `Run`, `Sit`, `Stand`, `Walk`), each with a
-variable `data` of 11 columns: timestamp, accelerometer X/Y/Z, and seven further channels (not used).
-The `.mat` files are provided by CDTA and are **not** included in this repository; put them in `data/`.
+Seven MATLAB files, one per activity: `Fall.mat`, `Jump.mat`, `Lay.mat`, `Run.mat`, `Sit.mat`, `Stand.mat`, `Walk.mat`.
 
-| Activity | Samples | Windows (128) | Segments |
-|---|---|---|---|
+Each contains an 11-column numeric matrix named `data`: timestamp, accelerometer X/Y/Z, and seven additional sensor channels not used by the baseline model.
+
+| Activity | Samples | 128-sample windows | Segments |
+|---|---:|---:|---:|
 | Fall | 6,016 | 47 | 13 |
 | Jump | 18,304 | 143 | 12 |
 | Lay | 42,240 | 330 | 12 |
@@ -41,181 +31,124 @@ The `.mat` files are provided by CDTA and are **not** included in this repositor
 | Sit | 44,032 | 344 | 10 |
 | Stand | 52,480 | 410 | 16 |
 | Walk | 45,696 | 357 | 13 |
+| **Total** | **245,760** | **1,920** | **89** |
 
-Notes that matter for the evaluation:
+Recording segments are inferred from timestamp resets; subject/session identities are unavailable. Timestamp units and sensor mapping have not been independently confirmed. The median timestamp step suggests approximately 51.2 Hz **if timestamps are in milliseconds**, giving about 2.50 seconds per 128-sample window.
 
-- The median timestamp step is 19.53 units, about 51.2 Hz if the unit is milliseconds, so a
-  128-sample window lasts about 2.5 s (the assignment states 2.56 s at 50 Hz). The unit is unconfirmed.
-- Timestamps are not monotonic. Each file is a concatenation of several recording segments; a new
-  segment starts at every timestamp reset (89 segments in total).
-- There are no subject or session identifiers, so segments are the only proxy for independent recordings.
+Raw recordings are **not included** in this repository. Place authorized copies under `data/` locally.
 
-## Method
+## Methodology
 
-1. **Windows**: non-overlapping windows of 128 samples (no leftover samples).
-2. **Features** (12 per window): max, min, mean and standard deviation (`ddof=1`) of X, Y and Z.
-3. **Models**: KNN, SVM (RBF or linear) and Decision Tree, each in a pipeline with standardisation
-   fitted on the training data only.
-4. **Tuning**: grid search with 5-fold stratified cross-validation on the training split only,
-   scored by balanced accuracy. The test split is used once.
-5. **Protocols** (10 runs each, seed 42 + run number):
-   - **A. Random**: stratified random 75/25 split of windows (requested by the supervisor).
-   - **B. Segment-grouped**: whole segments are assigned to train or test, class by class, so no
-     segment appears on both sides. Tuning folds are grouped too.
-6. **Metrics**: accuracy, balanced accuracy, weighted/macro F1, MCC and macro one-vs-rest ROC-AUC.
-7. **Statistical tests** (`stat_tests.py`):
-   - permutation test against chance level (random protocol);
-   - paired Wilcoxon signed-rank and Nadeau-Bengio corrected t-test between models, Holm-adjusted;
-   - Friedman test over the three models.
+### Windowing and features
 
-   The runs reuse the same windows, so they are not independent and p-values are approximate.
+The baseline extracts non-overlapping 128-sample windows and computes 12 features per window:
 
-## Project structure
+- X: maximum, minimum, mean, sample standard deviation
+- Y: maximum, minimum, mean, sample standard deviation
+- Z: maximum, minimum, mean, sample standard deviation
 
-```
+Standard deviation uses `ddof=1`. Timestamps and other sensor channels are excluded from the feature vector. Each file's sample count is divisible by 128; one window in the dataset crosses an inferred timestamp reset, a limitation of the original windowing procedure.
+
+### Models and tuning
+
+- **KNN:** neighbors, distance weighting, and Manhattan/Euclidean distance.
+- **SVM:** RBF and linear kernels, with `C` and (for RBF) `gamma` tuned.
+- **Decision Tree:** split criterion, maximum depth, and minimum split/leaf sizes.
+
+Grid search uses five-fold cross-validation on training data, optimizing balanced accuracy. Imputation and scaling, where applicable, are fitted within training pipelines to avoid test-data leakage.
+
+### Evaluation protocols
+
+**A — Random window split:** 10 stratified 75/25 train/test splits, with seeds starting at 42. Windows from the same inferred segment may appear in both sets.
+
+**B — Segment-grouped split:** 10 splits holding out complete inferred recording segments. Group-aware folds are also used for hyperparameter tuning. Because whole segments are held out, the test fraction is roughly 30–35% of windows.
+
+Reported metrics include accuracy, balanced accuracy, weighted precision/recall/F1, macro F1, MCC, and macro one-vs-rest ROC-AUC. Statistical analysis includes a permutation test, Wilcoxon signed-rank test, Nadeau–Bengio corrected resampled t-test, Holm adjustment, and Friedman test. Repeated splits share data, so statistical p-values are approximate.
+
+## Saved Models and Inference
+
+The project saves **one final fitted model per algorithm** after the evaluation experiments. The repeated runs estimate performance; they are **not** cumulative training. The final model is refitted on all 1,920 feature windows using selected hyperparameters.
+
+Saved Joblib artifacts include the fitted preprocessing/classifier pipeline and metadata such as class labels, feature names/order, hyperparameters, evaluation scores, and library versions. The persistence workflow maintains dated model files, a `latest` copy, and a `models_registry.csv` record of saved versions.
+
+### Save models
+
+1. Launch the Streamlit dashboard and load the data.
+2. Run the ML experiments.
+3. Open **Downloads → Trained models** to save final models to the local models folder or download individual `.joblib` files.
+4. Download the model ZIP bundle for later inference, if offered in the dashboard.
+
+Keep generated model artifacts local unless you deliberately want to publish them. You can exclude `models/` from Git with `.gitignore`.
+
+### Predict without retraining
+
+1. Open **Predict activities with a saved model** at the top of the dashboard, or use `predict_app.py` / `predict.py` where available.
+2. Upload the saved model ZIP bundle.
+3. Upload compatible raw Shimmer `.mat` or `.csv` recordings, or a CSV containing the 12 expected statistical features.
+4. Select a model and run prediction.
+5. View predictions per 128-sample window, a majority-vote activity for each recording, and download predictions as CSV.
+
+When a true activity label is available, the inference interface can also show evaluation metrics and a confusion table. Inference must preserve the original feature definitions, order, and sensor mapping. Treat an uploaded raw recording as one continuous recording; do not silently window across unknown boundaries.
+
+**Important:** Saving a model preserves its fitted parameters; it does not make KNN, SVM, or Decision Tree learn incrementally. Accuracy measured on the same data used to refit a final model is not a valid estimate of generalization. Use the held-out experiment results instead.
+
+**Security:** Joblib files can execute code when loaded. Only load model files from trusted sources.
+
+## Project Structure
+
+```text
 .
-├── app.py                  # Streamlit dashboard
-├── data_utils.py           # load / clean MAT and CSV files
-├── feature_extraction.py   # 128-sample windows, 12 features, segment group_id
-├── ml_experiments.py       # models, nested tuning, repeated evaluation (random / grouped)
-├── stat_tests.py           # permutation test, paired tests, Friedman
-├── model_io.py             # save / load / use the trained final models
-├── eda_visualizations.py   # exploratory plots used by the dashboard
-├── model_visualizations.py # model comparison plots used by the dashboard
+├── app.py                   # Streamlit dashboard
+├── predict_app.py           # Standalone inference interface (if present)
+├── predict.py               # Command-line inference (if present)
+├── model_io.py              # Model persistence and inference utilities
+├── data_utils.py            # Data loading and cleaning
+├── feature_extraction.py    # Windowing and feature extraction
+├── ml_experiments.py        # Training, tuning, evaluation
+├── stat_tests.py            # Statistical analysis
+├── eda_visualizations.py    # Exploratory plots
+├── model_visualizations.py  # Model comparison plots
 ├── requirements.txt
-├── data/                   # put Fall.mat ... Walk.mat here (git-ignored)
-├── models/                 # saved final models (*.joblib, git-ignored)
-├── results/                # CSV outputs of the experiments reported above
-└── figures/                # figures used in this README
+├── data/                    # Local raw data; not committed
+├── models/                  # Local saved models; not committed
+└── results/                 # Generated evaluation results
 ```
 
-## Dashboard screenshots
+## Installation and Usage
 
-| | |
-|---|---|
-| ![Overview](figures/screenshots/ui1_overview.png) | ![Raw signals](figures/screenshots/ui2_compare_activities.png) |
-| Overview tab and sidebar settings | Raw Signals tab (Fall vs Jump) |
-| ![Hyperparameters](figures/screenshots/ui4_hyperparameters.png) | ![MCC per run](figures/screenshots/ui3_run_mcc.png) |
-| ML Experiments tab: selected hyperparameters | Model Comparison tab: MCC per run |
-| ![Confusion matrices](figures/screenshots/ui6_confusion_matrices.png) | ![Downloads](figures/screenshots/ui5_downloads.png) |
-| Model Comparison tab: confusion matrices | Downloads tab |
+Create and activate a virtual environment (Windows PowerShell):
 
-(Screenshots were taken with a test proportion of 0.20; the results above use 0.25.)
-
-## Installation
-
-```bash
+```powershell
 python -m venv .venv
-# Windows PowerShell: .\.venv\Scripts\Activate.ps1
-# Linux / macOS:      source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
 
-## Usage
+Run the dashboard:
 
-### Dashboard
-
-```bash
+```powershell
 python -m streamlit run app.py
 ```
 
-Set **Dataset folder** in the sidebar to the folder holding the `.mat` files (or upload them),
-then pick an **Evaluation protocol** (random or segment-grouped) and run the experiments from the
-*ML Experiments* tab. Results, p-values and CSV downloads are in the *Model Comparison* and
-*Downloads* tabs. The default dataset path in `app.py` is a Windows path: change `DEFAULT_PATH`
-for your machine.
+Use the dashboard to load the recordings, explore signals, compare both evaluation protocols, inspect metrics and statistical tests, and save or load trained models.
 
-### From Python
+If needed, install model persistence dependencies:
 
-```python
-import pandas as pd
-from ml_experiments import repeated_random_split_experiments
-
-features = pd.read_csv("results/features_128.csv")   # 1,920 windows, 12 features + metadata
-
-result = repeated_random_split_experiments(
-    features,
-    n_runs=10,                 # at least 10; 100 is possible for a research run
-    split_mode="grouped",      # "random" (supervisor protocol) or "grouped"
-    n_permutations=100,        # permutation test, random protocol only
-)
-
-print(result["summary"])           # mean and std of every metric per model
-print(result["pairwise_tests"])    # Wilcoxon + corrected t-test (Holm)
-print(result["chance_test"])       # None in grouped mode
+```powershell
+python -m pip install joblib scipy
 ```
 
-To rebuild the features from the raw files:
+## Reproducibility and Limitations
 
-```python
-import glob
-from data_utils import load_uploaded_files, clean_raw_data
-from feature_extraction import extract_window_features, validate_feature_table
+- Experiment runs use reproducible random seeds (starting at 42).
+- Inferred segments are based on timestamp resets, not verified participant identifiers.
+- Class frequencies are imbalanced; Fall has only 47 windows.
+- Timestamp units, sampling rate, and column mapping require independent confirmation.
+- The permutation test is for protocol A, and repeated-run statistical tests should be interpreted cautiously.
+- Saved models should be evaluated on genuinely unseen recordings before deployment in real-world activity monitoring.
 
-raw, _ = load_uploaded_files(sorted(glob.glob("data/*.mat")))
-clean, report = clean_raw_data(raw)
-features = validate_feature_table(extract_window_features(clean))
-```
+## Future Work
 
-A full 10-run evaluation with grid search takes a few minutes on a laptop (about 3 minutes for the
-random protocol and 1.5 minutes for the grouped one in our runs).
-
-## Saving and using the trained models
-
-The 10 (or more) runs are **evaluation only**: every run trains a fresh model on a different split, and
-KNN, SVM and Decision Tree cannot be "trained a bit more" (calling `fit` again restarts from scratch).
-The model to keep is the **final model**: the tuned hyperparameters, refitted on all windows.
-
-- **Dashboard:** *Downloads* tab, section *Trained models*: **Save final models to this folder**
-  writes the files below, or download each model as a `.joblib`.
-- **Python:**
-
-```python
-import model_io
-
-model_io.save_final_models(result, "models", n_windows=len(features))   # after an experiment
-
-bundle = model_io.load_model("models/svm_grouped_latest.joblib")
-label, probabilities = model_io.predict_window(bundle, window_xyz)       # window_xyz: (128, 3) array X, Y, Z
-table, activity = model_io.predict_recording(bundle, recording_xyz)      # longer recording, majority vote
-```
-
-Each save writes `<model>_<protocol>_<date>.joblib` (never overwritten), `<model>_<protocol>_latest.joblib`,
-and one line per model in `models/models_registry.csv`, so every retraining stays traceable. A file contains the
-full pipeline (imputer, scaler, classifier), the class names, the 12 feature names, the tuned parameters, the
-cross-run metrics and the library versions. To "train more", add the new recordings, re-extract the features,
-re-run the experiments and save again: you get a new versioned model and the registry shows how the scores change.
-
-Keep in mind: the saved model is trained on all windows, so its own accuracy on those windows means nothing.
-Its expected performance is the one measured over the runs (protocol A is optimistic, protocol B is the
-more realistic estimate for unseen segments). Load a model with the same scikit-learn version it was saved with.
-
-## Reproducibility
-
-- Seed 42; run *r* uses seed 42 + *r*.
-- Per-run outputs for both protocols are in `results/` (`*_results.csv`, `*_summary.csv`,
-  `*_per_class_metrics.csv`, `*_pairwise_tests.csv`, `*_best_parameters.csv`).
-- The random protocol reproduces the first figures reported during the internship
-  (KNN accuracy 0.962, MCC 0.955).
-
-## Limitations
-
-- Segments come from timestamp resets, not from verified recording or participant identifiers.
-  The grouped protocol is a control, not proof of generalisation to new subjects.
-- Ten runs give limited resolution for p-values; the permutation test is computed for the random
-  protocol only and uses models tuned on all windows.
-- Timestamp units, the meaning of the extra channels and the sampling frequency are unconfirmed.
-- Fall has only 47 windows, so its recall is uncertain.
-
-## Roadmap
-
-- [ ] Transfer learning: acceleration magnitude to image (CWT scalogram or Gramian angular field),
-      pre-trained VGG/ResNet with frozen early layers and a retrained classifier head, evaluated
-      with the same protocols, metrics and tests.
-- [ ] Richer features (RMS, median, skewness, kurtosis, signal magnitude, frequency-domain energy),
-      mainly to separate Sit from Stand.
-- [ ] 100-run version of the protocol if required for the final report.
-
-## Author
-
-Hadil Khelif, Master 2 Bioinformatics, USTHB. Supervisor: Dr. Oussama Kerdjidj (CDTA).
+- Compare transfer learning with pre-trained VGG or ResNet models using image representations of accelerometer signals, such as CWT scalograms or Gramian angular fields.
+- Investigate additional time- and frequency-domain features (RMS, median, skewness, kurtosis, magnitude, and spectral energy).
+- Evaluate on verified participant-independent splits when participant IDs become available.
